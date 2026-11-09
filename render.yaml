@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: coinsentra-trading-brain-v8
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /health
+    disk:
+      name: coinsentra-v8-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATA_DIR
+        value: /var/data
+      - key: DASHBOARD_PASSWORD
+        generateValue: true
