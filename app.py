@@ -1,943 +1,1322 @@
+
+# ============================================================
+# COINSENTRA TRADING BRAIN V9
+# RENDER EDITION - REMOTE START / STOP
+# BYBIT PUBLIC DATA - PAPER TRADING ONLY
+# ============================================================
+
 import os
 import json
 import time
-import threading
+import math
 import logging
-from datetime import datetime, timezone, date
-from pathlib import Path
+import threading
+from datetime import datetime, date
+from functools import wraps
 
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, request, render_template_string
 from pybit.unified_trading import HTTP
 
-# =========================================================
-# COINSENTRA TRADING BRAIN V8
-# PUBLIC DASHBOARD - PAPER TRADING ONLY
-# =========================================================
 
-APP_NAME = "CoinSentra Trading Brain"
-VERSION = "V8"
+# ============================================================
+# SETTINGS
+# ============================================================
+
+APP_NAME = "CoinSentra Trading Brain V9"
+
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 10000))
+
+TESTNET = False
+CATEGORY = "linear"
 
 SYMBOLS = ["ETHUSDT", "XRPUSDT", "SOLUSDT", "SUIUSDT"]
 
 LEVERAGE = 8
+SCAN_SECONDS = 60
+
 TAKE_PROFIT = 0.02
 STOP_LOSS = 0.02
 
+DAILY_LOSS_LIMIT = 6.0
 STARTING_BALANCE = 100.0
+
 RISK_PER_TRADE = 0.005
 MAX_POSITION_VALUE = 0.10
 MAX_OPEN_POSITIONS = 2
-DAILY_LOSS_LIMIT = 6.0
 
-SCAN_INTERVAL = 60
-MIN_AI_SCORE = 70
+MIN_SIGNAL_SCORE = 70
+ORDERBOOK_DEPTH = 50
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "."))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "coinsentra_state.json"
+STATE_FILE = "coinsentra_v9_state.json"
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("CoinSentra")
+CONTROL_PIN = os.environ.get("CONTROL_PIN", "")
+
+WHALE_THRESHOLDS = {
+    "ETHUSDT": 100000,
+    "XRPUSDT": 50000,
+    "SOLUSDT": 50000,
+    "SUIUSDT": 25000
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 app = Flask(__name__)
 
-# Public Bybit market data only. No API keys and no order functions.
-exchange = HTTP(testnet=False)
+session = HTTP(testnet=TESTNET)
 
-lock = threading.RLock()
+state_lock = threading.RLock()
+engine_lock = threading.Lock()
+
+trading_enabled = False
 engine_started = False
+last_scan = "Not scanned yet"
+last_error = ""
+engine_status = "STARTING"
 
-state = {
-    "balance": STARTING_BALANCE,
-    "realized_pnl": 0.0,
-    "daily_pnl": 0.0,
-    "daily_date": str(date.today()),
-    "positions": [],
-    "signals": {},
-    "market": {},
-    "whales": {},
-    "events": [],
-    "last_scan": None,
-    "running": False,
-    "errors": []
-}
+stop_event = threading.Event()
 
 
-# =========================================================
-# STATE STORAGE
-# =========================================================
+# ============================================================
+# STATE
+# ============================================================
+
+def new_state():
+    return {
+        "balance": STARTING_BALANCE,
+        "day": str(date.today()),
+        "daily_realized": 0.0,
+        "positions": {},
+        "closed_trades": [],
+        "last_oi": {},
+        "scan_count": 0
+    }
+
 
 def load_state():
-    global state
-    try:
-        if STATE_FILE.exists():
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
 
-            if isinstance(saved, dict):
-                for key in state:
-                    if key in saved:
-                        state[key] = saved[key]
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
 
-            if not isinstance(state.get("positions"), list):
-                state["positions"] = []
+            defaults = new_state()
 
-            if not isinstance(state.get("signals"), dict):
-                state["signals"] = {}
+            for key, value in defaults.items():
+                if key not in data:
+                    data[key] = value
 
-    except Exception as exc:
-        log.warning("Could not load saved state: %s", exc)
+            return data
+
+        except Exception:
+            logging.exception("State loading failed")
+
+    return new_state()
+
+
+state = load_state()
 
 
 def save_state():
+
+    with state_lock:
+
+        temporary = STATE_FILE + ".tmp"
+
+        with open(temporary, "w") as f:
+            json.dump(state, f, indent=2)
+
+        os.replace(temporary, STATE_FILE)
+
+
+def number(value, default=0.0):
+
     try:
-        with lock:
-            temp_file = STATE_FILE.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
-            temp_file.replace(STATE_FILE)
-    except Exception as exc:
-        log.warning("Could not save state: %s", exc)
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
 
-def add_event(message):
-    with lock:
-        state["events"].insert(0, {
-            "time": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
-            "message": str(message)
-        })
-        state["events"] = state["events"][:40]
+def timestamp():
+
+    return datetime.now().astimezone().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
-def add_error(message):
-    with lock:
-        state["errors"].insert(0, str(message))
-        state["errors"] = state["errors"][:10]
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+def authorized():
+
+    if not CONTROL_PIN:
+        return False
+
+    supplied = request.headers.get(
+        "X-Control-PIN",
+        request.form.get("pin", "")
+    )
+
+    return supplied == CONTROL_PIN
 
 
-# =========================================================
+def require_pin(function):
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+
+        if not authorized():
+            return jsonify({
+                "success": False,
+                "error": "Incorrect PIN or CONTROL_PIN not configured"
+            }), 403
+
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+# ============================================================
+# BYBIT PUBLIC DATA
+# ============================================================
+
+def api_result(response):
+
+    if response.get("retCode") != 0:
+        raise RuntimeError(str(response))
+
+    return response.get("result", {})
+
+
+def get_candles(symbol, interval):
+
+    result = api_result(
+        session.get_kline(
+            category=CATEGORY,
+            symbol=symbol,
+            interval=interval,
+            limit=220
+        )
+    )
+
+    rows = list(reversed(result.get("list", [])))
+
+    return [{
+        "open": number(x[1]),
+        "high": number(x[2]),
+        "low": number(x[3]),
+        "close": number(x[4]),
+        "volume": number(x[5]),
+        "turnover": number(x[6])
+    } for x in rows]
+
+
+def get_ticker(symbol):
+
+    result = api_result(
+        session.get_tickers(
+            category=CATEGORY,
+            symbol=symbol
+        )
+    )
+
+    rows = result.get("list", [])
+
+    if not rows:
+        raise RuntimeError("Ticker unavailable")
+
+    return rows[0]
+
+
+def get_orderbook(symbol):
+
+    result = api_result(
+        session.get_orderbook(
+            category=CATEGORY,
+            symbol=symbol,
+            limit=ORDERBOOK_DEPTH
+        )
+    )
+
+    bids = [
+        (number(x[0]), number(x[1]))
+        for x in result.get("b", [])
+    ]
+
+    asks = [
+        (number(x[0]), number(x[1]))
+        for x in result.get("a", [])
+    ]
+
+    return bids, asks
+
+
+def get_trades(symbol):
+
+    result = api_result(
+        session.get_public_trade_history(
+            category=CATEGORY,
+            symbol=symbol,
+            limit=100
+        )
+    )
+
+    return result.get("list", [])
+
+
+def get_open_interest(symbol):
+
+    result = api_result(
+        session.get_open_interest(
+            category=CATEGORY,
+            symbol=symbol,
+            intervalTime="5min",
+            limit=2
+        )
+    )
+
+    rows = result.get("list", [])
+
+    return (
+        number(rows[0].get("openInterest"))
+        if rows else 0.0
+    )
+
+
+# ============================================================
 # INDICATORS
-# =========================================================
+# ============================================================
 
-def ema(values, period):
+def EMA(values, period):
+
     if len(values) < period:
         return None
 
-    multiplier = 2 / (period + 1)
+    alpha = 2 / (period + 1)
     result = sum(values[:period]) / period
 
     for value in values[period:]:
-        result = (value * multiplier) + (result * (1 - multiplier))
+        result = alpha * value + (1 - alpha) * result
 
     return result
 
 
-def rsi(values, period=14):
+def RSI(values, period=14):
+
     if len(values) < period + 1:
-        return 50.0
+        return None
 
-    gains = []
-    losses = []
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
 
     if avg_loss == 0:
         return 100.0
 
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - 100 / (1 + avg_gain / avg_loss)
 
 
-def bollinger(values, period=20):
+def MACD(values):
+
+    fast = EMA(values, 12)
+    slow = EMA(values, 26)
+
+    if fast is None or slow is None:
+        return None
+
+    return fast - slow
+
+
+def BOLLINGER(values, period=20):
+
     if len(values) < period:
         return None, None, None
 
     sample = values[-period:]
     middle = sum(sample) / period
-    variance = sum((x - middle) ** 2 for x in sample) / period
-    deviation = variance ** 0.5
 
-    return middle + 2 * deviation, middle, middle - 2 * deviation
+    variance = sum(
+        (x - middle) ** 2 for x in sample
+    ) / period
 
+    deviation = math.sqrt(variance)
 
-def macd(values):
-    fast = ema(values, 12)
-    slow = ema(values, 26)
-
-    if fast is None or slow is None:
-        return 0.0, 0.0
-
-    return fast - slow, 0.0
-
-
-def adx_estimate(highs, lows, closes, period=14):
-    if len(closes) < period + 2:
-        return 0.0
-
-    plus_moves = []
-    minus_moves = []
-    true_ranges = []
-
-    for i in range(1, len(closes)):
-        up = highs[i] - highs[i - 1]
-        down = lows[i - 1] - lows[i]
-
-        plus_moves.append(max(up, 0) if up > down else 0)
-        minus_moves.append(max(down, 0) if down > up else 0)
-
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
-        )
-        true_ranges.append(tr)
-
-    tr_avg = sum(true_ranges[-period:]) / period
-    if tr_avg == 0:
-        return 0.0
-
-    plus_di = 100 * (sum(plus_moves[-period:]) / period) / tr_avg
-    minus_di = 100 * (sum(minus_moves[-period:]) / period) / tr_avg
-
-    total = plus_di + minus_di
-    if total == 0:
-        return 0.0
-
-    return abs(plus_di - minus_di) / total * 100
-
-
-# =========================================================
-# BYBIT MARKET DATA
-# =========================================================
-
-def get_candles(symbol, interval):
-    response = exchange.get_kline(
-        category="linear",
-        symbol=symbol,
-        interval=interval,
-        limit=100
+    return (
+        middle + 2 * deviation,
+        middle,
+        middle - 2 * deviation
     )
 
-    rows = response.get("result", {}).get("list", [])
-    rows = list(reversed(rows))
 
-    candles = []
-    for row in rows:
-        candles.append({
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5])
-        })
+def ADX(candles, period=14):
 
-    return candles
+    if len(candles) < period * 2 + 1:
+        return None
 
+    tr_values = []
+    plus_values = []
+    minus_values = []
 
-def get_orderbook_data(symbol):
-    response = exchange.get_orderbook(
-        category="linear",
-        symbol=symbol,
-        limit=50
-    )
+    for i in range(1, len(candles)):
 
-    result = response.get("result", {})
-    bids = result.get("b", [])
-    asks = result.get("a", [])
+        current = candles[i]
+        previous = candles[i - 1]
 
-    bid_volume = sum(float(x[1]) for x in bids[:20])
-    ask_volume = sum(float(x[1]) for x in asks[:20])
+        up = current["high"] - previous["high"]
+        down = previous["low"] - current["low"]
 
-    total = bid_volume + ask_volume
-    imbalance = 0.0
-
-    if total > 0:
-        imbalance = (bid_volume - ask_volume) / total * 100
-
-    bid_wall = max(
-        [float(x[1]) for x in bids],
-        default=0
-    )
-    ask_wall = max(
-        [float(x[1]) for x in asks],
-        default=0
-    )
-
-    return {
-        "imbalance": round(imbalance, 2),
-        "bid_volume": round(bid_volume, 2),
-        "ask_volume": round(ask_volume, 2),
-        "bid_wall": round(bid_wall, 2),
-        "ask_wall": round(ask_wall, 2)
-    }
-
-
-def get_whale_activity(symbol):
-    response = exchange.get_public_trade_history(
-        category="linear",
-        symbol=symbol,
-        limit=100
-    )
-
-    trades = response.get("result", {}).get("list", [])
-
-    buy_volume = 0.0
-    sell_volume = 0.0
-    large_trades = []
-
-    for trade in trades:
-        price = float(trade.get("price", 0))
-        size = float(trade.get("size", 0))
-        value = price * size
-        side = trade.get("side", "")
-
-        if side == "Buy":
-            buy_volume += value
-        else:
-            sell_volume += value
-
-        if value >= 10000:
-            large_trades.append({
-                "side": side,
-                "value": round(value, 2)
-            })
-
-    return {
-        "buy_volume": round(buy_volume, 2),
-        "sell_volume": round(sell_volume, 2),
-        "large_trades": large_trades[:5],
-        "large_count": len(large_trades)
-    }
-
-
-def get_open_interest_change(symbol):
-    try:
-        response = exchange.get_open_interest(
-            category="linear",
-            symbol=symbol,
-            intervalTime="5min",
-            limit=2
+        plus_values.append(
+            up if up > down and up > 0 else 0
         )
 
-        rows = response.get("result", {}).get("list", [])
-
-        if len(rows) >= 2:
-            newest = float(rows[0]["openInterest"])
-            older = float(rows[1]["openInterest"])
-
-            if older:
-                return round((newest - older) / older * 100, 2)
-
-    except Exception:
-        pass
-
-    return 0.0
-
-
-def get_funding_rate(symbol):
-    try:
-        response = exchange.get_tickers(
-            category="linear",
-            symbol=symbol
+        minus_values.append(
+            down if down > up and down > 0 else 0
         )
 
-        rows = response.get("result", {}).get("list", [])
-        if rows:
-            return float(rows[0].get("fundingRate", 0)) * 100
+        tr_values.append(max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
+        ))
 
-    except Exception:
-        pass
+    dx_values = []
 
-    return 0.0
+    for i in range(period, len(tr_values)):
 
+        start = i - period + 1
 
-# =========================================================
-# ANALYSIS AND AI SCORE
-# =========================================================
+        tr = sum(tr_values[start:i + 1])
 
-def analyze_symbol(symbol):
-    candles5 = get_candles(symbol, "5")
-    candles15 = get_candles(symbol, "15")
-
-    if len(candles5) < 35 or len(candles15) < 35:
-        raise ValueError("Not enough candle data")
-
-    closes5 = [x["close"] for x in candles5]
-    highs5 = [x["high"] for x in candles5]
-    lows5 = [x["low"] for x in candles5]
-    volumes5 = [x["volume"] for x in candles5]
-
-    closes15 = [x["close"] for x in candles15]
-
-    price = closes5[-1]
-
-    ema9 = ema(closes5, 9)
-    ema21 = ema(closes5, 21)
-    ema50_15 = ema(closes15, 50)
-
-    rsi_value = rsi(closes5)
-    macd_value, _ = macd(closes5)
-
-    upper, middle, lower = bollinger(closes5)
-    adx_value = adx_estimate(highs5, lows5, closes5)
-
-    avg_volume = sum(volumes5[-21:-1]) / 20
-    volume_ratio = volumes5[-1] / avg_volume if avg_volume else 0
-
-    orderbook = get_orderbook_data(symbol)
-    whales = get_whale_activity(symbol)
-    oi_change = get_open_interest_change(symbol)
-    funding = get_funding_rate(symbol)
-
-    buy_score = 0
-    sell_score = 0
-
-    if ema9 > ema21:
-        buy_score += 15
-    else:
-        sell_score += 15
-
-    if price > ema50_15:
-        buy_score += 15
-    else:
-        sell_score += 15
-
-    if 50 <= rsi_value <= 68:
-        buy_score += 12
-    elif 32 <= rsi_value <= 50:
-        sell_score += 12
-    elif rsi_value > 72:
-        sell_score += 8
-    elif rsi_value < 28:
-        buy_score += 8
-
-    if macd_value > 0:
-        buy_score += 10
-    else:
-        sell_score += 10
-
-    if volume_ratio >= 1.5:
-        if closes5[-1] > closes5[-2]:
-            buy_score += 10
-        else:
-            sell_score += 10
-
-    if orderbook["imbalance"] > 10:
-        buy_score += 12
-    elif orderbook["imbalance"] < -10:
-        sell_score += 12
-
-    if whales["buy_volume"] > whales["sell_volume"] * 1.2:
-        buy_score += 8
-    elif whales["sell_volume"] > whales["buy_volume"] * 1.2:
-        sell_score += 8
-
-    if adx_value >= 20:
-        if ema9 > ema21:
-            buy_score += 8
-        else:
-            sell_score += 8
-
-    if oi_change > 0 and buy_score > sell_score:
-        buy_score += 5
-    elif oi_change > 0 and sell_score > buy_score:
-        sell_score += 5
-
-    buy_score = min(100, buy_score)
-    sell_score = min(100, sell_score)
-
-    if buy_score >= MIN_AI_SCORE and buy_score > sell_score:
-        signal = "LONG"
-        score = buy_score
-    elif sell_score >= MIN_AI_SCORE and sell_score > buy_score:
-        signal = "SHORT"
-        score = sell_score
-    else:
-        signal = "WAIT"
-        score = max(buy_score, sell_score)
-
-    return {
-        "symbol": symbol,
-        "price": price,
-        "signal": signal,
-        "score": score,
-        "buy_score": buy_score,
-        "sell_score": sell_score,
-        "rsi": round(rsi_value, 2),
-        "ema9": round(ema9, 8),
-        "ema21": round(ema21, 8),
-        "ema50_15m": round(ema50_15, 8),
-        "macd": round(macd_value, 8),
-        "adx": round(adx_value, 2),
-        "volume_ratio": round(volume_ratio, 2),
-        "bollinger_upper": upper,
-        "bollinger_middle": middle,
-        "bollinger_lower": lower,
-        "orderbook": orderbook,
-        "whales": whales,
-        "open_interest_change": oi_change,
-        "funding_rate": round(funding, 5),
-        "updated": datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    }
-
-
-# =========================================================
-# PAPER TRADING ENGINE
-# =========================================================
-
-def current_equity():
-    return float(state["balance"]) + sum(
-        float(p.get("unrealized_pnl", 0))
-        for p in state["positions"]
-    )
-
-
-def close_position(position, exit_price, reason):
-    entry = float(position["entry"])
-    notional = float(position["notional"])
-    direction = position["side"]
-
-    if direction == "LONG":
-        move = (exit_price - entry) / entry
-    else:
-        move = (entry - exit_price) / entry
-
-    gross_pnl = notional * move
-    fees = notional * 0.00055 + notional * (exit_price / entry) * 0.00055
-    net_pnl = gross_pnl - fees
-
-    with lock:
-        state["balance"] += net_pnl
-        state["realized_pnl"] += net_pnl
-        state["daily_pnl"] += net_pnl
-
-        position["exit"] = exit_price
-        position["pnl"] = round(net_pnl, 4)
-        position["reason"] = reason
-        position["closed_at"] = datetime.now(timezone.utc).isoformat()
-
-        state["positions"].remove(position)
-
-    add_event(
-        f"{position['symbol']} {direction} closed: "
-        f"{reason}, PnL ${net_pnl:.2f}"
-    )
-
-
-def manage_positions():
-    with lock:
-        positions = list(state["positions"])
-        market = dict(state["market"])
-
-    for position in positions:
-        symbol = position["symbol"]
-        info = market.get(symbol)
-
-        if not info:
+        if tr <= 0:
             continue
 
-        price = float(info["price"])
-        entry = float(position["entry"])
-        side = position["side"]
+        plus = 100 * sum(
+            plus_values[start:i + 1]
+        ) / tr
 
-        if side == "LONG":
-            move = (price - entry) / entry
-        else:
-            move = (entry - price) / entry
+        minus = 100 * sum(
+            minus_values[start:i + 1]
+        ) / tr
 
-        position["unrealized_pnl"] = round(
-            float(position["notional"]) * move, 4
+        total = plus + minus
+
+        dx = (
+            100 * abs(plus - minus) / total
+            if total > 0 else 0
         )
 
-        if move >= TAKE_PROFIT:
-            close_position(position, price, "TAKE PROFIT")
-        elif move <= -STOP_LOSS:
-            close_position(position, price, "STOP LOSS")
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return None
+
+    return sum(dx_values[-period:]) / period
 
 
-def open_paper_position(info):
-    symbol = info["symbol"]
-    side = info["signal"]
-    price = float(info["price"])
+def analyze(candles):
 
-    with lock:
-        if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
+    closes = [x["close"] for x in candles]
+
+    if len(closes) < 60:
+        raise ValueError("Not enough candles")
+
+    e9 = EMA(closes, 9)
+    e21 = EMA(closes, 21)
+    e50 = EMA(closes, 50)
+
+    upper, middle, lower = BOLLINGER(closes)
+
+    volumes = [x["volume"] for x in candles[-21:-1]]
+    average_volume = sum(volumes) / len(volumes) if volumes else 0
+
+    volume_ratio = (
+        candles[-1]["volume"] / average_volume
+        if average_volume > 0 else 1
+    )
+
+    return {
+        "price": closes[-1],
+        "ema9": e9,
+        "ema21": e21,
+        "ema50": e50,
+        "rsi": RSI(closes),
+        "macd": MACD(closes),
+        "bb_upper": upper,
+        "bb_middle": middle,
+        "bb_lower": lower,
+        "adx": ADX(candles),
+        "volume_ratio": volume_ratio,
+        "bull": e9 > e21 > e50,
+        "bear": e9 < e21 < e50
+    }
+
+
+# ============================================================
+# WHALE TRACKER
+# ============================================================
+
+def whale_tracker(symbol, trades, bids, asks, oi):
+
+    threshold = WHALE_THRESHOLDS[symbol]
+
+    buys = 0.0
+    sells = 0.0
+    count = 0
+
+    for trade in trades:
+
+        value = (
+            number(trade.get("price"))
+            * number(trade.get("size"))
+        )
+
+        side = str(trade.get("side", "")).lower()
+
+        if value >= threshold:
+
+            count += 1
+
+            if side == "buy":
+                buys += value
+
+            elif side == "sell":
+                sells += value
+
+    bid_depth = sum(p * q for p, q in bids[:20])
+    ask_depth = sum(p * q for p, q in asks[:20])
+
+    total = bid_depth + ask_depth
+
+    imbalance = bid_depth / total if total > 0 else 0.5
+
+    bid_wall = max(
+        [p * q for p, q in bids[:20]],
+        default=0
+    )
+
+    ask_wall = max(
+        [p * q for p, q in asks[:20]],
+        default=0
+    )
+
+    previous = number(state["last_oi"].get(symbol))
+
+    oi_change = 0.0
+
+    if previous > 0 and oi > 0:
+        oi_change = (oi - previous) / previous * 100
+
+    if oi > 0:
+        state["last_oi"][symbol] = oi
+
+    difference = buys - sells
+
+    if difference > threshold:
+        signal = "BUY PRESSURE"
+    elif difference < -threshold:
+        signal = "SELL PRESSURE"
+    else:
+        signal = "NEUTRAL"
+
+    return {
+        "buys": buys,
+        "sells": sells,
+        "count": count,
+        "imbalance": imbalance,
+        "bid_wall": bid_wall,
+        "ask_wall": ask_wall,
+        "oi_change": oi_change,
+        "signal": signal
+    }
+
+
+# ============================================================
+# AI SCORE
+# ============================================================
+
+def AI_SCORE(tf5, tf15, whale, funding):
+
+    score = 50
+    reasons = []
+
+    if tf5["bull"]:
+        score += 12
+        reasons.append("5m bullish EMA")
+    elif tf5["bear"]:
+        score -= 12
+        reasons.append("5m bearish EMA")
+
+    if tf15["bull"]:
+        score += 16
+        reasons.append("15m bullish EMA")
+    elif tf15["bear"]:
+        score -= 16
+        reasons.append("15m bearish EMA")
+
+    if tf5["rsi"] is not None:
+
+        if 52 <= tf5["rsi"] <= 70:
+            score += 6
+        elif tf5["rsi"] < 35:
+            score += 2
+        elif tf5["rsi"] > 75:
+            score -= 7
+
+    if tf15["rsi"] is not None:
+
+        if 50 <= tf15["rsi"] <= 68:
+            score += 5
+        elif tf15["rsi"] > 75:
+            score -= 5
+
+    if tf5["macd"] is not None:
+
+        if tf5["macd"] > 0:
+            score += 5
+            reasons.append("MACD positive")
+        else:
+            score -= 5
+            reasons.append("MACD negative")
+
+    if tf5["adx"] is not None and tf5["adx"] >= 20:
+
+        if tf5["bull"]:
+            score += 4
+        elif tf5["bear"]:
+            score -= 4
+
+        reasons.append("Strong trend")
+
+    if tf5["volume_ratio"] >= 1.8:
+
+        if tf5["bull"]:
+            score += 5
+        elif tf5["bear"]:
+            score -= 5
+
+        reasons.append("Volume spike")
+
+    if whale["signal"] == "BUY PRESSURE":
+        score += 10
+        reasons.append("Whale buying")
+
+    elif whale["signal"] == "SELL PRESSURE":
+        score -= 10
+        reasons.append("Whale selling")
+
+    if whale["imbalance"] >= 0.60:
+        score += 6
+        reasons.append("Buy order book pressure")
+
+    elif whale["imbalance"] <= 0.40:
+        score -= 6
+        reasons.append("Sell order book pressure")
+
+    if whale["oi_change"] >= 1:
+
+        if score > 55:
+            score += 3
+        elif score < 45:
+            score -= 3
+
+        reasons.append("Open interest increasing")
+
+    elif whale["oi_change"] <= -1:
+        reasons.append("Open interest decreasing")
+
+    if funding > 0.0008:
+        score -= 3
+        reasons.append("Crowded longs")
+
+    elif funding < -0.0008:
+        score += 3
+        reasons.append("Negative funding")
+
+    score = max(0, min(100, score))
+
+    if score >= MIN_SIGNAL_SCORE:
+        direction = "LONG"
+    elif score <= 100 - MIN_SIGNAL_SCORE:
+        direction = "SHORT"
+    else:
+        direction = "WAIT"
+
+    return score, direction, reasons
+
+
+# ============================================================
+# PAPER POSITION MANAGEMENT
+# ============================================================
+
+def calculate_pnl(position, price):
+
+    direction = 1 if position["side"] == "LONG" else -1
+
+    return (
+        (price - position["entry"])
+        * direction
+        * position["quantity"]
+    )
+
+
+def close_position(symbol, price, reason):
+
+    with state_lock:
+
+        position = state["positions"].pop(symbol, None)
+
+        if not position:
+            return
+
+        gross = calculate_pnl(position, price)
+
+        fees = (
+            position["entry"]
+            * position["quantity"]
+            * 0.0011
+        )
+
+        net = gross - fees
+
+        state["balance"] += net
+        state["daily_realized"] += net
+
+        state["closed_trades"].append({
+            "symbol": symbol,
+            "side": position["side"],
+            "entry": position["entry"],
+            "exit": price,
+            "quantity": position["quantity"],
+            "gross_pnl": gross,
+            "fees": fees,
+            "net_pnl": net,
+            "reason": reason,
+            "time": timestamp()
+        })
+
+        state["closed_trades"] = state["closed_trades"][-200:]
+
+    logging.info(
+        "POSITION CLOSED %s %s net=%s",
+        symbol, reason, net
+    )
+
+    print("CLOSED:", symbol, reason, "NET:", round(net, 3))
+
+    save_state()
+
+
+def open_position(symbol, side, price, score):
+
+    global trading_enabled
+
+    with state_lock:
+
+        if not trading_enabled:
+            return
+
+        if symbol in state["positions"]:
             return
 
         if len(state["positions"]) >= MAX_OPEN_POSITIONS:
             return
 
-        if any(p["symbol"] == symbol for p in state["positions"]):
+        if state["daily_realized"] <= -DAILY_LOSS_LIMIT:
             return
 
-        equity = current_equity()
-        risk_amount = max(0, equity * RISK_PER_TRADE)
+        equity = state["balance"]
 
-        # Position sizing based on 2% stop distance.
-        notional_by_risk = risk_amount / STOP_LOSS
-        notional_cap = equity * MAX_POSITION_VALUE * LEVERAGE
-        notional = min(notional_by_risk, notional_cap)
+        risk_amount = equity * RISK_PER_TRADE
+        stop_distance = price * STOP_LOSS
 
-        if notional <= 0:
+        if stop_distance <= 0 or equity <= 0:
             return
 
-        position = {
-            "id": f"{symbol}-{int(time.time())}",
-            "symbol": symbol,
+        quantity_by_risk = risk_amount / stop_distance
+
+        maximum_notional = (
+            equity * MAX_POSITION_VALUE * LEVERAGE
+        )
+
+        quantity_by_cap = maximum_notional / price
+
+        quantity = min(quantity_by_risk, quantity_by_cap)
+
+        if quantity <= 0:
+            return
+
+        if side == "LONG":
+            tp = price * (1 + TAKE_PROFIT)
+            sl = price * (1 - STOP_LOSS)
+        else:
+            tp = price * (1 - TAKE_PROFIT)
+            sl = price * (1 + STOP_LOSS)
+
+        state["positions"][symbol] = {
             "side": side,
             "entry": price,
-            "notional": round(notional, 2),
+            "quantity": quantity,
+            "tp": tp,
+            "sl": sl,
+            "score": score,
             "leverage": LEVERAGE,
-            "score": info["score"],
-            "opened_at": datetime.now(timezone.utc).isoformat(),
-            "unrealized_pnl": 0.0
+            "opened": timestamp()
         }
 
-        state["positions"].append(position)
-
-    add_event(
-        f"PAPER {side} opened: {symbol} at {price:.6g} "
-        f"(score {info['score']})"
-    )
-
-
-# =========================================================
-# ENGINE LOOP
-# =========================================================
-
-def scan_once():
-    today = str(date.today())
-
-    with lock:
-        if state["daily_date"] != today:
-            state["daily_date"] = today
-            state["daily_pnl"] = 0.0
-
-    for symbol in SYMBOLS:
-        try:
-            info = analyze_symbol(symbol)
-
-            with lock:
-                state["signals"][symbol] = info
-                state["market"][symbol] = {
-                    "price": info["price"]
-                }
-                state["whales"][symbol] = info["whales"]
-
-            if info["signal"] in ("LONG", "SHORT"):
-                open_paper_position(info)
-
-        except Exception as exc:
-            log.exception("Scan failed for %s", symbol)
-            add_error(f"{symbol}: {str(exc)[:180]}")
-
-    manage_positions()
-
-    with lock:
-        state["last_scan"] = datetime.now(timezone.utc).isoformat()
-        state["running"] = True
+    print("NEW PAPER POSITION:", symbol, side, price)
 
     save_state()
 
 
-def engine_loop():
-    add_event("CoinSentra Trading Brain V8 started")
+def manage_positions(prices):
 
-    while True:
+    for symbol in list(state["positions"].keys()):
+
+        if symbol not in prices:
+            continue
+
+        price = prices[symbol]
+        position = state["positions"].get(symbol)
+
+        if not position:
+            continue
+
+        if position["side"] == "LONG":
+
+            if price >= position["tp"]:
+                close_position(symbol, price, "TAKE PROFIT")
+
+            elif price <= position["sl"]:
+                close_position(symbol, price, "STOP LOSS")
+
+        else:
+
+            if price <= position["tp"]:
+                close_position(symbol, price, "TAKE PROFIT")
+
+            elif price >= position["sl"]:
+                close_position(symbol, price, "STOP LOSS")
+
+
+# ============================================================
+# MARKET SCANNER
+# ============================================================
+
+def run_scan():
+
+    global last_scan, last_error
+
+    rows = []
+    prices = {}
+
+    for symbol in SYMBOLS:
+
         try:
-            scan_once()
-        except Exception as exc:
-            log.exception("Engine error")
-            add_error(str(exc)[:180])
 
-        time.sleep(SCAN_INTERVAL)
+            candles5 = get_candles(symbol, "5")
+            candles15 = get_candles(symbol, "15")
+
+            tf5 = analyze(candles5)
+            tf15 = analyze(candles15)
+
+            ticker = get_ticker(symbol)
+
+            price = number(
+                ticker.get("lastPrice"),
+                tf5["price"]
+            )
+
+            prices[symbol] = price
+
+            bids, asks = get_orderbook(symbol)
+            trades = get_trades(symbol)
+            oi = get_open_interest(symbol)
+
+            whale = whale_tracker(
+                symbol, trades, bids, asks, oi
+            )
+
+            funding = number(ticker.get("fundingRate"))
+
+            score, direction, reasons = AI_SCORE(
+                tf5, tf15, whale, funding
+            )
+
+            rows.append({
+                "symbol": symbol,
+                "price": price,
+                "score": score,
+                "direction": direction,
+                "rsi5": tf5["rsi"],
+                "rsi15": tf15["rsi"],
+                "whale": whale,
+                "reasons": reasons
+            })
+
+        except Exception as error:
+
+            last_error = f"{symbol}: {error}"
+
+            logging.exception("Scan error: %s", symbol)
+
+            print("DATA ERROR:", symbol, error)
+
+    # Existing positions are monitored even when stopped.
+    manage_positions(prices)
+
+    # New positions only when START is enabled.
+    if trading_enabled:
+
+        for row in rows:
+
+            if row["direction"] in ("LONG", "SHORT"):
+
+                open_position(
+                    row["symbol"],
+                    row["direction"],
+                    row["price"],
+                    row["score"]
+                )
+
+    with state_lock:
+        state["scan_count"] += 1
+
+    save_state()
+
+    last_scan = timestamp()
+    last_error = ""
+
+    print("\n" + "=" * 60)
+    print(APP_NAME)
+    print("SCAN:", last_scan)
+    print("TRADING ENABLED:", trading_enabled)
+    print("BALANCE:", round(state["balance"], 2))
+    print("DAILY PNL:", round(state["daily_realized"], 2))
+    print("OPEN POSITIONS:", len(state["positions"]))
+
+    for row in rows:
+
+        print(
+            row["symbol"],
+            "PRICE:", row["price"],
+            "SCORE:", row["score"],
+            "SIGNAL:", row["direction"],
+            "RSI5:", row["rsi5"],
+            "RSI15:", row["rsi15"],
+            "WHALE:", row["whale"]["signal"]
+        )
+
+    print("=" * 60)
+
+
+# ============================================================
+# BACKGROUND ENGINE
+# ============================================================
+
+def engine_loop():
+
+    global engine_status
+
+    engine_status = "RUNNING"
+
+    print("BACKGROUND ENGINE STARTED")
+
+    while not stop_event.is_set():
+
+        if not engine_lock.acquire(blocking=False):
+            stop_event.wait(2)
+            continue
+
+        try:
+
+            today = str(date.today())
+
+            if state["day"] != today:
+
+                state["day"] = today
+                state["daily_realized"] = 0.0
+
+                save_state()
+
+            run_scan()
+
+        except Exception as error:
+
+            last_message = str(error)
+
+            logging.exception("Engine error")
+
+            print("ENGINE ERROR:", last_message)
+
+            engine_status = "ERROR"
+
+        finally:
+            engine_lock.release()
+
+        engine_status = "RUNNING"
+
+        stop_event.wait(SCAN_SECONDS)
+
+    engine_status = "STOPPED"
 
 
 def start_engine():
+
     global engine_started
 
-    with lock:
+    with engine_lock:
+
         if engine_started:
             return
+
+        stop_event.clear()
+
+        thread = threading.Thread(
+            target=engine_loop,
+            daemon=True,
+            name="CoinSentraEngine"
+        )
+
         engine_started = True
-
-    thread = threading.Thread(
-        target=engine_loop,
-        name="CoinSentraEngine",
-        daemon=True
-    )
-    thread.start()
+        thread.start()
 
 
-# =========================================================
-# DASHBOARD
-# =========================================================
+# ============================================================
+# WEB DASHBOARD
+# ============================================================
 
-HTML = r"""
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CoinSentra Trading Brain V8</title>
+<meta http-equiv="refresh" content="15">
+<title>CoinSentra Trading Brain V9</title>
+
 <style>
-:root {
-  color-scheme: dark;
-  --bg:#080d18; --panel:#111a2b; --line:#263550;
-  --text:#edf3ff; --muted:#93a4bf; --green:#22d39a;
-  --red:#ff647c; --blue:#67a9ff; --gold:#f6c86b;
-}
-* {box-sizing:border-box}
 body {
-  margin:0; background:var(--bg); color:var(--text);
-  font-family:Arial,sans-serif;
+    background: #101827;
+    color: white;
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 18px;
 }
-header {
-  padding:22px 16px; border-bottom:1px solid var(--line);
-  background:#0d1525;
+.container {
+    max-width: 850px;
+    margin: auto;
 }
-h1 {font-size:23px;margin:0 0 7px}
-.sub {color:var(--muted);font-size:13px}
-main {max-width:1200px;margin:auto;padding:15px}
-.grid {
-  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
-  gap:10px;margin-bottom:14px;
+h1 {
+    color: #42d9ff;
+    font-size: 25px;
 }
 .card {
-  background:var(--panel);border:1px solid var(--line);
-  border-radius:13px;padding:14px;min-width:0;
+    background: #1b293b;
+    border-radius: 13px;
+    padding: 17px;
+    margin: 12px 0;
 }
-.label {font-size:12px;color:var(--muted);margin-bottom:8px}
-.value {font-size:22px;font-weight:bold;overflow-wrap:anywhere}
-.section {font-size:17px;margin:22px 0 10px}
-table {width:100%;border-collapse:collapse;font-size:13px}
-th,td {padding:11px 8px;border-bottom:1px solid var(--line);text-align:left}
-th {color:var(--muted);font-weight:normal}
-.green {color:var(--green)}
-.red {color:var(--red)}
-.blue {color:var(--blue)}
-.gold {color:var(--gold)}
-.pill {
-  display:inline-block;padding:5px 8px;border-radius:7px;
-  background:#1c2a40;font-size:11px;font-weight:bold;
+.status {
+    font-size: 20px;
+    font-weight: bold;
 }
 button {
-  background:#2677d9;color:white;border:0;border-radius:8px;
-  padding:11px 15px;font-weight:bold;cursor:pointer;
+    border: 0;
+    border-radius: 10px;
+    padding: 17px;
+    width: 48%;
+    font-size: 18px;
+    font-weight: bold;
+    color: white;
+    margin: 5px 1%;
 }
-.small {font-size:12px;color:var(--muted)}
-.event {padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}
-.two {display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.scroll {overflow-x:auto}
-.warning {color:var(--gold);font-size:12px;line-height:1.5}
-@media(max-width:700px) {
- .grid {grid-template-columns:repeat(2,minmax(0,1fr))}
- .two {grid-template-columns:1fr}
- table {min-width:700px}
+.stop { background: #d83c4d; }
+.start { background: #159b67; }
+input {
+    width: 95%;
+    padding: 13px;
+    border-radius: 8px;
+    border: 0;
+    margin: 8px 0;
+    font-size: 16px;
+}
+.small { color: #9fb2c9; }
+.green { color: #39dc99; }
+.red { color: #ff6476; }
+.row {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
 }
 </style>
 </head>
+
 <body>
-<header>
-  <h1>◈ COINSENTRA TRADING BRAIN <span class="blue">V8</span></h1>
-  <div class="sub">Bybit market intelligence · Paper trading · 5m + 15m analysis</div>
-</header>
-<main>
-  <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0">
-    <div class="small" id="status">Connecting to engine...</div>
-    <button onclick="refreshData()">↻ Refresh dashboard</button>
-  </div>
+<div class="container">
 
-  <div class="grid">
-    <div class="card"><div class="label">Paper balance</div><div class="value" id="balance">$100.00</div></div>
-    <div class="card"><div class="label">Realized PnL</div><div class="value" id="realized">$0.00</div></div>
-    <div class="card"><div class="label">Today's PnL</div><div class="value" id="daily">$0.00</div></div>
-    <div class="card"><div class="label">Open positions</div><div class="value" id="open">0 / 2</div></div>
-  </div>
+<h1>COINSENTRA TRADING BRAIN V9</h1>
+<p class="small">Bybit Whale Intelligence | Render Edition</p>
 
-  <div class="card">
-    <div class="section" style="margin-top:0">Market scanner</div>
-    <div class="scroll">
-    <table>
-      <thead><tr>
-        <th>Symbol</th><th>Price</th><th>Signal</th><th>AI score</th>
-        <th>RSI</th><th>ADX</th><th>Volume</th><th>Order book</th>
-      </tr></thead>
-      <tbody id="scanner"><tr><td colspan="8">Waiting for market data...</td></tr></tbody>
-    </table>
+<div class="card">
+    <div>TRADING STATUS</div>
+    <div class="status {{ 'green' if enabled else 'red' }}">
+        {{ 'ACTIVE - NEW PAPER TRADES ENABLED' if enabled else 'STOPPED - NEW TRADES DISABLED' }}
     </div>
-  </div>
+    <p class="small">Engine: {{ engine_status }}</p>
+    <p class="small">Last scan: {{ last_scan }}</p>
+    <p class="small">Last error: {{ last_error or 'None' }}</p>
+</div>
 
-  <div class="section">Open paper positions</div>
-  <div class="card scroll">
-    <table>
-      <thead><tr>
-        <th>Symbol</th><th>Side</th><th>Entry</th><th>Notional</th>
-        <th>Leverage</th><th>Unrealized PnL</th><th>AI score</th>
-      </tr></thead>
-      <tbody id="positions"><tr><td colspan="7">No open positions</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="section">Whale activity & market intelligence</div>
-  <div class="card scroll">
-    <table>
-      <thead><tr>
-        <th>Symbol</th><th>Buy volume</th><th>Sell volume</th>
-        <th>Large trades</th><th>Open interest change</th><th>Funding</th>
-      </tr></thead>
-      <tbody id="whales"><tr><td colspan="6">Waiting for data...</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="section">Recent activity</div>
-  <div class="two">
-    <div class="card"><div id="events" class="small">No events yet.</div></div>
-    <div class="card">
-      <div class="label">Risk settings</div>
-      <p class="small">Simulated leverage: <b>8×</b></p>
-      <p class="small">Take profit: <b>2%</b></p>
-      <p class="small">Stop loss: <b>2%</b></p>
-      <p class="small">Daily realized-loss limit: <b>$6</b></p>
-      <p class="small">Maximum open positions: <b>2</b></p>
-      <p class="small">Scan interval: <b>60 seconds</b></p>
-      <p class="warning">Paper trading only. This dashboard is public and has no login protection. Anyone with its URL can view it. Do not add API keys or private account information.</p>
+<div class="card">
+    <h3>REMOTE CONTROL</h3>
+    <input id="pin" type="password" placeholder="Enter your control PIN">
+    <div class="row">
+        <button class="stop" onclick="control('stop')">C - STOP</button>
+        <button class="start" onclick="control('start')">V - START</button>
     </div>
-  </div>
-  <div class="small" style="text-align:center;padding:22px">
-    COINSENTRA AI · V8 · Public market data · <span id="updated">Not updated</span>
-  </div>
-</main>
+    <p id="message" class="small">Enter PIN before controlling.</p>
+    <p class="small">Keyboard shortcuts: C = Stop, V = Start.</p>
+</div>
+
+<div class="card">
+    <h3>ACCOUNT</h3>
+    <p>Paper balance: <b>$ {{ "%.2f"|format(balance) }}</b></p>
+    <p>Daily realized PNL: <b>$ {{ "%.2f"|format(daily_pnl) }}</b></p>
+    <p>Open positions: <b>{{ positions|length }} / 2</b></p>
+    <p>Completed scans: <b>{{ scan_count }}</b></p>
+</div>
+
+<div class="card">
+    <h3>SETTINGS</h3>
+    <p>Leverage simulation: {{ leverage }}x</p>
+    <p>Take profit: {{ tp }}%</p>
+    <p>Stop loss: {{ sl }}%</p>
+    <p>Daily loss limit: ${{ loss_limit }}</p>
+    <p class="small">Paper trading only. No live orders.</p>
+</div>
+
+<div class="card">
+    <h3>OPEN PAPER POSITIONS</h3>
+    {% if positions %}
+        {% for symbol, p in positions.items() %}
+            <p>
+            <b>{{ symbol }} - {{ p.side }}</b><br>
+            Entry: {{ p.entry }}<br>
+            TP: {{ p.tp }}<br>
+            SL: {{ p.sl }}<br>
+            Quantity: {{ "%.6f"|format(p.quantity) }}
+            </p>
+            <hr>
+        {% endfor %}
+    {% else %}
+        <p class="small">No open positions.</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h3>RECENT CLOSED TRADES</h3>
+    {% for trade in trades %}
+        <p>
+        {{ trade.time }}<br>
+        {{ trade.symbol }} {{ trade.side }} |
+        {{ trade.reason }} |
+        Net: ${{ "%.3f"|format(trade.net_pnl) }}
+        </p>
+        <hr>
+    {% else %}
+        <p class="small">No completed trades yet.</p>
+    {% endfor %}
+</div>
+
+<p class="small">
+CoinSentra V9 | Public Bybit market data | Paper trading
+</p>
+
+</div>
+
 <script>
-function money(v) {
-  return "$" + Number(v || 0).toFixed(2);
+async function control(action) {
+    const pin = document.getElementById("pin").value;
+    const message = document.getElementById("message");
+
+    message.textContent = "Sending command...";
+
+    try {
+        const response = await fetch("/control/" + action, {
+            method: "POST",
+            headers: {
+                "X-Control-PIN": pin
+            }
+        });
+
+        const result = await response.json();
+
+        message.textContent = result.success
+            ? result.message
+            : result.error;
+
+        if (result.success) {
+            setTimeout(() => location.reload(), 700);
+        }
+
+    } catch (error) {
+        message.textContent = "Connection error: " + error;
+    }
 }
-function cls(v) {
-  return Number(v) >= 0 ? "green" : "red";
-}
-function price(v) {
-  return Number(v || 0).toPrecision(7);
-}
-async function refreshData() {
-  try {
-    const response = await fetch("/api/status");
-    const d = await response.json();
 
-    document.getElementById("status").textContent =
-      d.running ? "● Engine running · Last scan: " + (d.last_scan || "starting")
-                : "Engine starting...";
+document.addEventListener("keydown", function(event) {
+    if (event.target.tagName === "INPUT") return;
 
-    document.getElementById("balance").textContent = money(d.balance);
-    document.getElementById("realized").innerHTML =
-      '<span class="' + cls(d.realized_pnl) + '">' + money(d.realized_pnl) + '</span>';
-    document.getElementById("daily").innerHTML =
-      '<span class="' + cls(d.daily_pnl) + '">' + money(d.daily_pnl) + '</span>';
-    document.getElementById("open").textContent =
-      (d.positions || []).length + " / 2";
+    if (event.key.toLowerCase() === "c") {
+        control("stop");
+    }
 
-    const signals = d.signals || {};
-    document.getElementById("scanner").innerHTML =
-      Object.values(signals).map(x => {
-        let signalClass = x.signal === "LONG" ? "green" :
-                          x.signal === "SHORT" ? "red" : "gold";
-        return `<tr>
-          <td><b>${x.symbol}</b></td>
-          <td>${price(x.price)}</td>
-          <td><span class="pill ${signalClass}">${x.signal}</span></td>
-          <td><b>${x.score}/100</b></td>
-          <td>${x.rsi}</td><td>${x.adx}</td>
-          <td>${x.volume_ratio}x</td>
-          <td class="${Number(x.orderbook.imbalance)>=0?'green':'red'}">${x.orderbook.imbalance}%</td>
-        </tr>`;
-      }).join("") || '<tr><td colspan="8">Waiting for market data...</td></tr>';
-
-    document.getElementById("positions").innerHTML =
-      (d.positions || []).map(p => `<tr>
-        <td><b>${p.symbol}</b></td><td>${p.side}</td>
-        <td>${price(p.entry)}</td><td>${money(p.notional)}</td>
-        <td>${p.leverage}x</td>
-        <td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td>
-        <td>${p.score}</td>
-      </tr>`).join("") || '<tr><td colspan="7">No open positions</td></tr>';
-
-    document.getElementById("whales").innerHTML =
-      Object.entries(signals).map(([symbol,x]) => `<tr>
-        <td><b>${symbol}</b></td>
-        <td class="green">${money(x.whales.buy_volume)}</td>
-        <td class="red">${money(x.whales.sell_volume)}</td>
-        <td>${x.whales.large_count}</td>
-        <td>${x.open_interest_change}%</td>
-        <td>${x.funding_rate}%</td>
-      </tr>`).join("") || '<tr><td colspan="6">Waiting for data...</td></tr>';
-
-    document.getElementById("events").innerHTML =
-      (d.events || []).map(e =>
-        `<div class="event"><span class="blue">${e.time}</span> — ${e.message}</div>`
-      ).join("") || "No events yet.";
-
-    document.getElementById("updated").textContent =
-      "Dashboard updated " + new Date().toLocaleTimeString();
-
-  } catch (e) {
-    document.getElementById("status").textContent =
-      "Could not connect to dashboard API. Retrying...";
-  }
-}
-refreshData();
-setInterval(refreshData, 10000);
+    if (event.key.toLowerCase() === "v") {
+        control("start");
+    }
+});
 </script>
+
 </body>
 </html>
 """
 
 
-# =========================================================
-# WEB ROUTES
-# =========================================================
+# ============================================================
+# ROUTES
+# ============================================================
 
 @app.route("/")
-def home():
-    return Response(HTML, mimetype="text/html")
+def dashboard():
+
+    with state_lock:
+
+        positions = {
+            symbol: dict(position)
+            for symbol, position in state["positions"].items()
+        }
+
+        trades = list(reversed(state["closed_trades"][-10:]))
+
+        return render_template_string(
+            HTML,
+            enabled=trading_enabled,
+            engine_status=engine_status,
+            last_scan=last_scan,
+            last_error=last_error,
+            balance=state["balance"],
+            daily_pnl=state["daily_realized"],
+            positions=positions,
+            trades=trades,
+            scan_count=state["scan_count"],
+            leverage=LEVERAGE,
+            tp=TAKE_PROFIT * 100,
+            sl=STOP_LOSS * 100,
+            loss_limit=DAILY_LOSS_LIMIT
+        )
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": VERSION})
+
+    return jsonify({
+        "status": "ok",
+        "engine": engine_status,
+        "trading_enabled": trading_enabled
+    })
 
 
-@app.route("/api/status")
-def api_status():
-    with lock:
-        result = {
-            "balance": state["balance"],
-            "realized_pnl": state["realized_pnl"],
-            "daily_pnl": state["daily_pnl"],
-            "positions": state["positions"],
-            "signals": state["signals"],
-            "whales": state["whales"],
-            "events": state["events"],
-            "last_scan": state["last_scan"],
-            "running": state["running"],
-            "errors": state["errors"]
-        }
+@app.route("/status")
+def status():
 
-    return jsonify(result)
+    return jsonify({
+        "engine": engine_status,
+        "trading_enabled": trading_enabled,
+        "last_scan": last_scan,
+        "last_error": last_error,
+        "balance": state["balance"],
+        "daily_pnl": state["daily_realized"],
+        "open_positions": len(state["positions"]),
+        "scan_count": state["scan_count"]
+    })
 
 
-# =========================================================
-# STARTUP
-# =========================================================
+@app.route("/control/stop", methods=["POST"])
+@require_pin
+def stop_trading():
 
-load_state()
+    global trading_enabled
+
+    with state_lock:
+        trading_enabled = False
+
+    save_state()
+
+    logging.warning("REMOTE STOP COMMAND")
+
+    return jsonify({
+        "success": True,
+        "message": "STOPPED: No new paper positions will open. Existing positions remain monitored."
+    })
+
+
+@app.route("/control/start", methods=["POST"])
+@require_pin
+def start_trading():
+
+    global trading_enabled
+
+    with state_lock:
+
+        if state["daily_realized"] <= -DAILY_LOSS_LIMIT:
+
+            return jsonify({
+                "success": False,
+                "error": "Daily loss limit reached. Cannot restart trading today."
+            }), 403
+
+        trading_enabled = True
+
+    logging.warning("REMOTE START COMMAND")
+
+    return jsonify({
+        "success": True,
+        "message": "STARTED: New paper trading positions are enabled."
+    })
+
+
+# ============================================================
+# START WEB SERVER ENGINE
+# ============================================================
+
 start_engine()
 
+
 if __name__ == "__main__":
+
     app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8080))
+        host=HOST,
+        port=PORT,
+        debug=False,
+        use_reloader=False
     )
