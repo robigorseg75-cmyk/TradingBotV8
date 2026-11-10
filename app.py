@@ -320,19 +320,22 @@ def get_whale_activity(symbol):
         "count": whale_count,
         "buy_value": buy_value,
         "sell_value": sell_value
-    }
-
-
+    
+    
 def get_funding_rate(symbol):
-    response = session.get_funding_rate(
-        category=CATEGORY,
+    response = session.get_funding_rate_history(
+        category="linear",
         symbol=symbol,
         limit=1
     )
 
     rows = response.get("result", {}).get("list", [])
+
     if not rows:
         return 0.0
+
+    return number(rows[0].get("fundingRate"))
+
 
     return number(rows[0].get("fundingRate"))
 
