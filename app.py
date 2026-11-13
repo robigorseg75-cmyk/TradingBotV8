@@ -12,14 +12,15 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V14.1
+# COINSENTRA TRADING BRAIN V14.2
 # BYBIT | RENDER | PAPER TRADING ONLY
+# ADAPTIVE INDICATOR LEARNING
 # ============================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("CoinSentraV14_1")
+log = logging.getLogger("CoinSentraV14_2")
 
 # ---------------- SETTINGS ----------------
 
@@ -44,8 +45,36 @@ CONFIRMATION_INTERVAL = "15"
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "14.1"
+VERSION = "14.2"
 MAX_HISTORY = 500
+
+# ---------------- ADAPTIVE LEARNING ----------------
+
+LEARNING_ENABLED = True
+LEARNING_MIN_SAMPLES = 10
+LEARNING_WINDOW = 30
+LEARNING_MIN_WEIGHT = 0.75
+LEARNING_MAX_WEIGHT = 1.25
+
+LEARNING_RATE = 0.25
+
+LEARNING_FEATURES = [
+    "trend_fast",
+    "trend_slow",
+    "rsi",
+    "macd",
+    "volume",
+    "orderbook",
+    "confirmation",
+    "adx",
+    "funding",
+    "open_interest"
+]
+
+DEFAULT_WEIGHTS = {
+    name: 1.0 for name in LEARNING_FEATURES
+}
+
 
 # ---------------- STORAGE ----------------
 
@@ -55,6 +84,7 @@ STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v14.json")
 # Configure these in Render Environment.
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+
 
 # ---------------- BYBIT CONNECTION ----------------
 
@@ -69,6 +99,7 @@ if API_KEY and API_SECRET:
         testnet=False,
         timeout=15
     )
+
 
 # ---------------- STATE ----------------
 
@@ -89,7 +120,16 @@ state = {
     "account_balance": None,
     "symbols": {},
     "scan_count": 0,
-    "version": VERSION
+    "version": VERSION,
+
+    "learning": {
+        "enabled": LEARNING_ENABLED,
+        "weights": dict(DEFAULT_WEIGHTS),
+        "samples": 0,
+        "updates": 0,
+        "last_update": None,
+        "last_result": "Waiting for completed trades"
+    }
 }
 
 
@@ -110,11 +150,10 @@ def safe_float(value, digits=6):
 
 
 # ============================================================
-# V14.1 STORAGE ENGINE
+# V14.2 STORAGE ENGINE
 # ============================================================
 
 def clean_trade(trade):
-    """Only retain genuinely completed trades."""
 
     if not isinstance(trade, dict):
         return None
@@ -150,7 +189,6 @@ def clean_trade(trade):
 
 
 def save_state():
-    """Atomic save to reduce risk of corrupted trade history."""
 
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -168,13 +206,13 @@ def save_state():
         os.replace(temp_file, STATE_FILE)
 
     except Exception:
-        log.exception("V14.1 state save failed")
+        log.exception("V14.2 state save failed")
 
 
 def load_state():
 
     if not os.path.exists(STATE_FILE):
-        log.info("New V14.1 paper account")
+        log.info("New V14.2 paper account")
         return
 
     try:
@@ -208,6 +246,48 @@ def load_state():
 
             if not isinstance(state["symbols"], dict):
                 state["symbols"] = {}
+
+            # Restore learning information without losing defaults.
+            saved_learning = saved.get("learning", {})
+
+            if isinstance(saved_learning, dict):
+
+                weights = saved_learning.get("weights", {})
+
+                if not isinstance(weights, dict):
+                    weights = {}
+
+                restored_weights = dict(DEFAULT_WEIGHTS)
+
+                for name in LEARNING_FEATURES:
+                    restored_weights[name] = max(
+                        LEARNING_MIN_WEIGHT,
+                        min(
+                            LEARNING_MAX_WEIGHT,
+                            number(
+                                weights.get(name),
+                                1.0
+                            )
+                        )
+                    )
+
+                state["learning"] = {
+                    "enabled": LEARNING_ENABLED,
+                    "weights": restored_weights,
+                    "samples": max(
+                        0,
+                        int(number(saved_learning.get("samples")))
+                    ),
+                    "updates": max(
+                        0,
+                        int(number(saved_learning.get("updates")))
+                    ),
+                    "last_update": saved_learning.get("last_update"),
+                    "last_result": saved_learning.get(
+                        "last_result",
+                        "Waiting for completed trades"
+                    )
+                }
 
             cleaned = []
             seen = set()
@@ -246,6 +326,7 @@ def load_state():
                 p.setdefault("current_price", p["entry"])
                 p.setdefault("unrealized_pnl", 0.0)
                 p.setdefault("trade_id", uuid.uuid4().hex)
+                p.setdefault("feature_snapshot", {})
 
                 valid_positions.append(p)
 
@@ -253,15 +334,16 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V14.1 RESTORED: %s open positions | %s completed trades",
+            "V14.2 RESTORED: %s open positions | %s completed trades | %s learning samples",
             len(state["positions"]),
-            len(state["history"])
+            len(state["history"]),
+            state["learning"]["samples"]
         )
 
         save_state()
 
     except Exception:
-        log.exception("V14.1 state loading failed")
+        log.exception("V14.2 state loading failed")
 
 
 def reset_daily():
@@ -275,6 +357,158 @@ def reset_daily():
             state["daily_pnl"] = 0.0
 
     save_state()
+
+
+# ============================================================
+# ADAPTIVE LEARNING ENGINE
+# ============================================================
+
+def learning_snapshot_for_side(features, side):
+
+    if not isinstance(features, dict):
+        return {}
+
+    direction = 1 if side == "LONG" else -1
+
+    result = {}
+
+    for name in LEARNING_FEATURES:
+
+        value = number(features.get(name))
+
+        result[name] = max(
+            -1.0,
+            min(1.0, value * direction)
+        )
+
+    return result
+
+
+def update_learning(trade):
+
+    if not LEARNING_ENABLED:
+        return
+
+    features = trade.get("feature_snapshot")
+
+    if not isinstance(features, dict) or not features:
+        return
+
+    pnl = number(trade.get("pnl"))
+
+    if pnl == 0:
+        return
+
+    outcome = 1.0 if pnl > 0 else -1.0
+
+    with lock:
+
+        learning = state["learning"]
+
+        learning["samples"] = int(
+            number(learning.get("samples"))
+        ) + 1
+
+        learning["last_result"] = (
+            "WIN" if outcome > 0 else "LOSS"
+        )
+
+        eligible = []
+
+        for item in state["history"]:
+
+            snapshot = item.get("feature_snapshot")
+
+            if not isinstance(snapshot, dict) or not snapshot:
+                continue
+
+            item_pnl = number(item.get("pnl"))
+
+            if item_pnl == 0:
+                continue
+
+            eligible.append({
+                "features": snapshot,
+                "outcome": 1.0 if item_pnl > 0 else -1.0
+            })
+
+        eligible = eligible[:LEARNING_WINDOW]
+
+        if len(eligible) < LEARNING_MIN_SAMPLES:
+
+            learning["last_update"] = now_text()
+
+            log.info(
+                "LEARNING COLLECTING DATA: %s/%s",
+                len(eligible),
+                LEARNING_MIN_SAMPLES
+            )
+
+            return
+
+        weights = learning["weights"]
+
+        correlations = {}
+
+        for name in LEARNING_FEATURES:
+
+            values = []
+
+            for sample in eligible:
+
+                feature_value = number(
+                    sample["features"].get(name)
+                )
+
+                values.append(
+                    feature_value * sample["outcome"]
+                )
+
+            correlation = (
+                sum(values) / len(values)
+                if values else 0.0
+            )
+
+            correlations[name] = correlation
+
+            # Small, bounded adjustment.
+            # A feature that agrees with profitable trades
+            # gains weight. A feature linked to losses loses weight.
+            adjustment = correlation * LEARNING_RATE
+
+            new_weight = number(weights.get(name), 1.0)
+            new_weight += adjustment
+
+            weights[name] = round(
+                max(
+                    LEARNING_MIN_WEIGHT,
+                    min(LEARNING_MAX_WEIGHT, new_weight)
+                ),
+                4
+            )
+
+        learning["weights"] = weights
+        learning["updates"] = int(
+            number(learning.get("updates"))
+        ) + 1
+
+        learning["last_update"] = now_text()
+
+        log.info(
+            "ADAPTIVE LEARNING UPDATE | samples=%s | weights=%s",
+            len(eligible),
+            weights
+        )
+
+
+def get_learning_weights():
+
+    with lock:
+        weights = dict(
+            state["learning"]["weights"]
+        )
+
+    return weights
 
 
 # ============================================================
@@ -582,71 +816,117 @@ def analyze_candles(candles):
 
 
 # ============================================================
-# SIGNAL ENGINE
+# SIGNAL ENGINE WITH ADAPTIVE WEIGHTS
 # ============================================================
 
 def calculate_signal(five, fifteen, imbalance, funding, oi_change):
+
+    weights = get_learning_weights()
 
     long_score = 0.0
     short_score = 0.0
 
     price = five["price"]
 
+    # Feature directions are expressed from LONG perspective.
+    features = {
+        "trend_fast": 0,
+        "trend_slow": 0,
+        "rsi": 0,
+        "macd": 0,
+        "volume": 0,
+        "orderbook": 0,
+        "confirmation": 0,
+        "adx": 0,
+        "funding": 0,
+        "open_interest": 0
+    }
+
     if five["ema9"] > five["ema21"]:
-        long_score += 14
+        features["trend_fast"] = 1
+        long_score += 14 * weights["trend_fast"]
+
     elif five["ema9"] < five["ema21"]:
-        short_score += 14
+        features["trend_fast"] = -1
+        short_score += 14 * weights["trend_fast"]
 
     if five["ema21"] > five["ema50"]:
-        long_score += 12
+        features["trend_slow"] = 1
+        long_score += 12 * weights["trend_slow"]
+
     elif five["ema21"] < five["ema50"]:
-        short_score += 12
+        features["trend_slow"] = -1
+        short_score += 12 * weights["trend_slow"]
 
     if 52 <= five["rsi"] <= 70:
-        long_score += 12
+        features["rsi"] = 1
+        long_score += 12 * weights["rsi"]
+
     elif 30 <= five["rsi"] < 48:
-        short_score += 12
+        features["rsi"] = -1
+        short_score += 12 * weights["rsi"]
 
     if five["macd"] > 0:
-        long_score += 10
+        features["macd"] = 1
+        long_score += 10 * weights["macd"]
+
     elif five["macd"] < 0:
-        short_score += 10
+        features["macd"] = -1
+        short_score += 10 * weights["macd"]
 
     if five["volume_ratio"] >= 1.3:
 
         if five["ema9"] > five["ema21"]:
-            long_score += 10
+            features["volume"] = 1
+            long_score += 10 * weights["volume"]
+
         elif five["ema9"] < five["ema21"]:
-            short_score += 10
+            features["volume"] = -1
+            short_score += 10 * weights["volume"]
 
     if imbalance > 0.15:
-        long_score += 12
+        features["orderbook"] = 1
+        long_score += 12 * weights["orderbook"]
+
     elif imbalance < -0.15:
-        short_score += 12
+        features["orderbook"] = -1
+        short_score += 12 * weights["orderbook"]
 
     if fifteen["ema9"] > fifteen["ema21"]:
-        long_score += 18
+        features["confirmation"] = 1
+        long_score += 18 * weights["confirmation"]
+
     elif fifteen["ema9"] < fifteen["ema21"]:
-        short_score += 18
+        features["confirmation"] = -1
+        short_score += 18 * weights["confirmation"]
 
     if five["adx"] >= 20:
 
         if five["ema9"] > five["ema21"]:
-            long_score += 6
+            features["adx"] = 1
+            long_score += 6 * weights["adx"]
+
         elif five["ema9"] < five["ema21"]:
-            short_score += 6
+            features["adx"] = -1
+            short_score += 6 * weights["adx"]
 
     if funding > 0.0005:
-        short_score += 3
+        features["funding"] = -1
+        short_score += 3 * weights["funding"]
+
     elif funding < -0.0005:
-        long_score += 3
+        features["funding"] = 1
+        long_score += 3 * weights["funding"]
 
     if oi_change > 0.2:
 
         if five["ema9"] > five["ema21"]:
-            long_score += 5
+            features["open_interest"] = 1
+            long_score += 5 * weights["open_interest"]
+
         elif five["ema9"] < five["ema21"]:
-            short_score += 5
+            features["open_interest"] = -1
+            short_score += 5 * weights["open_interest"]
 
     long_score = min(100, round(long_score))
     short_score = min(100, round(short_score))
@@ -672,7 +952,8 @@ def calculate_signal(five, fifteen, imbalance, funding, oi_change):
     return {
         "long_score": long_score,
         "short_score": short_score,
-        "signal": signal
+        "signal": signal,
+        "features": features
     }
 
 
@@ -740,7 +1021,7 @@ def account_totals():
 # OPEN PAPER POSITION
 # ============================================================
 
-def open_paper_position(symbol, side, price):
+def open_paper_position(symbol, side, price, features=None):
 
     with lock:
 
@@ -810,7 +1091,13 @@ def open_paper_position(symbol, side, price):
             "opened": now_text(),
             "unrealized_pnl": 0.0,
             "entry_fee": notional * FEE_RATE,
-            "fee_rate": FEE_RATE
+            "fee_rate": FEE_RATE,
+
+            # Save entry-time market conditions for learning.
+            "feature_snapshot": learning_snapshot_for_side(
+                features or {},
+                side
+            )
         }
 
         state["positions"].append(position)
@@ -824,7 +1111,7 @@ def open_paper_position(symbol, side, price):
 
 
 # ============================================================
-# V14.1 COMPLETED TRADE ENGINE
+# V14.2 COMPLETED TRADE ENGINE
 # ============================================================
 
 def close_paper_position(position, price, reason):
@@ -878,7 +1165,12 @@ def close_paper_position(position, price, reason):
             "net_pnl": round(net, 6),
             "reason": reason,
             "opened": live.get("opened", ""),
-            "closed": closed
+            "closed": closed,
+
+            # Preserve the original entry conditions.
+            "feature_snapshot": dict(
+                live.get("feature_snapshot", {})
+            )
         }
 
         state["balance"] += net
@@ -889,11 +1181,14 @@ def close_paper_position(position, price, reason):
 
         state["positions"].remove(live)
 
+        # Learn from the completed paper trade.
+        update_learning(trade)
+
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             state["running"] = False
 
         log.info(
-            "V14.1 COMPLETED TRADE | %s | %s | "
+            "V14.2 COMPLETED TRADE | %s | %s | "
             "Gross %.4f | Fees %.4f | Net %.4f",
             live["symbol"], reason, gross, fees, net
         )
@@ -1110,7 +1405,8 @@ def scan_symbol(symbol):
         open_paper_position(
             symbol,
             signal["signal"],
-            five["price"]
+            five["price"],
+            signal["features"]
         )
 
     return data
@@ -1122,7 +1418,7 @@ def scan_symbol(symbol):
 
 def background_worker():
 
-    log.info("CoinSentra V14.1 worker started")
+    log.info("CoinSentra V14.2 worker started")
 
     last_private_check = 0
 
@@ -1198,7 +1494,7 @@ def start_worker_once():
 
         thread = threading.Thread(
             target=background_worker,
-            name="CoinSentraV14_1Worker",
+            name="CoinSentraV14_2Worker",
             daemon=True
         )
 
@@ -1251,6 +1547,24 @@ def trade_statistics():
     }
 
 
+def learning_statistics():
+
+    with lock:
+
+        learning = state["learning"]
+
+        return {
+            "enabled": learning["enabled"],
+            "samples": learning["samples"],
+            "updates": learning["updates"],
+            "last_update": learning["last_update"],
+            "last_result": learning["last_result"],
+            "minimum_samples": LEARNING_MIN_SAMPLES,
+            "window": LEARNING_WINDOW,
+            "weights": dict(learning["weights"])
+        }
+
+
 # ============================================================
 # DASHBOARD
 # ============================================================
@@ -1261,7 +1575,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V14.1</title>
+<title>CoinSentra Trading Brain V14.2</title>
 
 <style>
 *{box-sizing:border-box}
@@ -1286,13 +1600,14 @@ th{color:#9bb0ce}
 .statgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .stat{background:#0c1728;border-radius:8px;padding:10px}
 .stat strong{display:block;font-size:18px;margin-top:5px}
+.weight{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #293a50}
 </style>
 </head>
 
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V14.1 | BYBIT | PAPER MODE ONLY</div>
+<div class="small">TRADING BRAIN V14.2 | BYBIT | PAPER MODE ONLY</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -1321,6 +1636,34 @@ END TRADING disables new entries immediately.
 Existing paper positions remain monitored for take-profit
 and stop-loss. This button does not close open positions.
 </p>
+</div>
+
+<div class="card">
+<h2>ADAPTIVE AI LEARNING</h2>
+<div class="statgrid">
+<div class="stat">
+<span class="small">Learning samples</span>
+<strong id="learnsamples">0</strong>
+</div>
+<div class="stat">
+<span class="small">Weight updates</span>
+<strong id="learnupdates">0</strong>
+</div>
+<div class="stat">
+<span class="small">Last result</span>
+<strong id="learnresult">Waiting</strong>
+</div>
+<div class="stat">
+<span class="small">Learning status</span>
+<strong id="learnstatus">Collecting data</strong>
+</div>
+</div>
+<p class="small" id="learnmessage">
+The learning engine studies completed paper trades.
+It needs at least 10 eligible trades before adjusting weights.
+</p>
+<h2>INDICATOR WEIGHTS</h2>
+<div id="weights" class="small">Waiting for learning data...</div>
 </div>
 
 <div class="card">
@@ -1390,7 +1733,7 @@ and stop-loss. This button does not close open positions.
 </div>
 
 <div class="card small">
-Version 14.1 | 5m + 15m confirmation | 8x simulated leverage<br>
+Version 14.2 | 5m + 15m confirmation | 8x simulated leverage<br>
 Take Profit 2% | Stop Loss 2% | Daily loss limit $6<br>
 Fee estimate: 0.055% per side<br>
 Last scan: <span id="last">Waiting</span><br>
@@ -1508,6 +1851,42 @@ async function update(){
   document.getElementById('losses').textContent=d.stats.losses;
   document.getElementById('realized').textContent=money(d.stats.history_realized_pnl);
   document.getElementById('fees').textContent=money(d.stats.total_fees);
+
+  // Adaptive learning display.
+  let learning=d.learning;
+
+  document.getElementById('learnsamples').textContent=
+   learning.samples+'/'+learning.minimum_samples+' minimum';
+
+  document.getElementById('learnupdates').textContent=
+   learning.updates;
+
+  document.getElementById('learnresult').textContent=
+   learning.last_result||'Waiting';
+
+  document.getElementById('learnstatus').textContent=
+   learning.samples>=learning.minimum_samples
+   ?'ADAPTIVE'
+   :'COLLECTING';
+
+  document.getElementById('learnmessage').textContent=
+   learning.samples>=learning.minimum_samples
+   ?'The engine is adjusting indicator weights using its recent completed paper trades. Last update: '+(learning.last_update||'Not available')
+   :'The engine needs '+(learning.minimum_samples-learning.samples)+' more eligible completed trades before its first adjustment.';
+
+  let weightRows='';
+
+  for(let [name,value] of Object.entries(learning.weights||{})){
+
+   weightRows+=`<div class="weight">
+    <span>${safe(name.replaceAll('_',' ').toUpperCase())}</span>
+    <b>${Number(value).toFixed(3)}x</b>
+   </div>`;
+
+  }
+
+  document.getElementById('weights').innerHTML=
+   weightRows||'Waiting for learning data...';
 
   document.getElementById('scanner').textContent=
    d.last_scan?'ACTIVE':'WAITING';
@@ -1641,7 +2020,8 @@ def status():
             "symbols": state["symbols"],
             "scan_count": state["scan_count"],
             "open_positions": len(state["positions"]),
-            "completed_trades": len(state["history"])
+            "completed_trades": len(state["history"]),
+            "learning": state["learning"]
         })
 
 
@@ -1702,7 +2082,8 @@ def api_data():
         "private_status": private_status,
         "account_balance": account_balance,
         "last_error": last_error,
-        "stats": trade_statistics()
+        "stats": trade_statistics(),
+        "learning": learning_statistics()
     })
 
 
