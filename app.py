@@ -162,7 +162,6 @@ def save_state():
 
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2)
-
             f.flush()
             os.fsync(f.fileno())
 
@@ -210,7 +209,6 @@ def load_state():
             if not isinstance(state["symbols"], dict):
                 state["symbols"] = {}
 
-            # Restore only valid completed trades.
             cleaned = []
             seen = set()
 
@@ -231,7 +229,6 @@ def load_state():
 
             state["history"] = cleaned[:MAX_HISTORY]
 
-            # Restore active positions.
             valid_positions = []
 
             for p in state["positions"]:
@@ -261,7 +258,6 @@ def load_state():
             len(state["history"])
         )
 
-        # Persist migrated state.
         save_state()
 
     except Exception:
@@ -848,7 +844,6 @@ def close_paper_position(position, price, reason):
             None
         )
 
-        # Prevent duplicate closing and duplicate history entries.
         if live is None:
             return False
 
@@ -886,11 +881,9 @@ def close_paper_position(position, price, reason):
             "closed": closed
         }
 
-        # Update account exactly once.
         state["balance"] += net
         state["daily_pnl"] += net
 
-        # Newest trade always appears first.
         state["history"].insert(0, trade)
         state["history"] = state["history"][:MAX_HISTORY]
 
@@ -905,7 +898,6 @@ def close_paper_position(position, price, reason):
             live["symbol"], reason, gross, fees, net
         )
 
-    # Save immediately after each completed trade.
     save_state()
 
     return True
@@ -1142,12 +1134,13 @@ def background_worker():
 
             reset_daily()
 
+            # Always monitor existing positions, even when
+            # new trading entries have been stopped.
             monitor_positions()
 
             for symbol in SYMBOLS:
 
                 try:
-
                     scan_symbol(symbol)
 
                 except Exception as e:
@@ -1279,9 +1272,10 @@ h2{color:#36d9ff;font-size:18px}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .big{font-size:22px;font-weight:bold;color:#35e0b0;margin-top:7px;overflow-wrap:anywhere}
 .small{font-size:12px;color:#9bb0ce;line-height:1.6}
-button{padding:13px;border:0;border-radius:8px;font-weight:bold;margin:5px 2px}
+button{padding:13px;border:0;border-radius:8px;font-weight:bold;margin:5px 2px;cursor:pointer}
 .start{background:#16b981;color:white}
-.stop{background:#dc4545;color:white}
+.stop{background:#dc2525;color:white}
+button:active{transform:scale(.98)}
 table{width:100%;border-collapse:collapse;font-size:12px;min-width:650px}
 td,th{padding:9px 6px;border-bottom:1px solid #293a50;text-align:left;white-space:nowrap}
 th{color:#9bb0ce}
@@ -1311,10 +1305,22 @@ th{color:#9bb0ce}
 
 <div class="card">
 <h2>CONTROL CENTER</h2>
-<button class="stop" onclick="control('stop')">STOP NEW TRADES (C)</button>
-<button class="start" onclick="control('start')">START TRADING (V)</button>
+
+<button class="stop" onclick="control('stop')">
+END TRADING (C)
+</button>
+
+<button class="start" onclick="control('start')">
+START TRADING (V)
+</button>
+
 <p id="control" class="small">Loading...</p>
-<p class="small">Existing paper positions remain monitored when stopped.</p>
+
+<p class="small">
+END TRADING disables new entries immediately.
+Existing paper positions remain monitored for take-profit
+and stop-loss. This button does not close open positions.
+</p>
 </div>
 
 <div class="card">
@@ -1397,6 +1403,12 @@ async function control(action){
 
  const message=document.getElementById('control');
 
+ if(action==='stop'){
+  if(!confirm('End trading? New positions will stop opening. Existing positions will still be monitored.')){
+   return;
+  }
+ }
+
  message.textContent='Sending command...';
 
  try{
@@ -1478,7 +1490,7 @@ async function update(){
   document.getElementById('count').textContent=d.positions.length;
 
   document.getElementById('control').textContent=
-   d.running?'NEW ENTRIES ENABLED':'STOPPED - MONITORING POSITIONS';
+   d.running?'TRADING ACTIVE - NEW ENTRIES ENABLED':'TRADING ENDED - MONITORING OPEN POSITIONS';
 
   document.getElementById('private').textContent=d.private_status;
 
@@ -1694,7 +1706,9 @@ def api_data():
     })
 
 
+# END TRADING: stop new entries, keep monitoring open positions.
 @app.route("/control/stop", methods=["POST"])
+@app.route("/control/end", methods=["POST"])
 def stop():
 
     with lock:
@@ -1702,9 +1716,11 @@ def stop():
 
     save_state()
 
+    log.warning("TRADING ENDED BY USER - existing positions remain monitored")
+
     return jsonify({
         "status": "stopped",
-        "message": "STOPPED: new paper entries disabled. Existing positions are still monitored."
+        "message": "TRADING ENDED: new entries disabled. Existing positions are still monitored."
     })
 
 
@@ -1724,9 +1740,11 @@ def start():
 
     save_state()
 
+    log.info("TRADING STARTED BY USER")
+
     return jsonify({
         "status": "started",
-        "message": "STARTED: new paper entries enabled."
+        "message": "TRADING STARTED: new paper entries enabled."
     })
 
 
