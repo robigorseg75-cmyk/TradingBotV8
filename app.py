@@ -1,3 +1,4 @@
+l
 import os
 import json
 import time
@@ -11,16 +12,16 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V15
+# COINSENTRA TRADING BRAIN V15.1
 # BYBIT | RENDER | PAPER TRADING ONLY
-# 5m + 15m + 1h CONFIRMATION
-# ATR STOPS | COOLDOWN | TRADE RECOVERY
+# ADAPTIVE LEARNING | ATR STOPS | COOLDOWN | TRADE RECOVERY
+# MACD REMOVED | FASTER SIGNAL ENGINE
 # ============================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("CoinSentraV15")
+log = logging.getLogger("CoinSentraV15.1")
 
 # ---------------- SETTINGS ----------------
 
@@ -35,8 +36,8 @@ START_BALANCE = 10000.0
 RISK_PER_TRADE = 3.0
 MAX_EQUITY_EXPOSURE = 0.10
 
-SCAN_SECONDS = 30
-ENTRY_SCORE = 68
+SCAN_SECONDS = 15
+ENTRY_SCORE = 62
 CONFIRMATION_INTERVAL = "15"
 HIGHER_INTERVAL = "60"
 
@@ -53,7 +54,7 @@ COOLDOWN_SECONDS = 600
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "15.0"
+VERSION = "15.1"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -66,7 +67,7 @@ LEARNING_MAX_WEIGHT = 1.25
 LEARNING_RATE = 0.15
 
 LEARNING_FEATURES = [
-    "trend_fast", "trend_slow", "rsi", "macd", "volume",
+    "trend_fast", "trend_slow", "rsi", "volume",
     "orderbook", "confirmation", "higher_timeframe",
     "adx", "funding", "open_interest"
 ]
@@ -253,13 +254,13 @@ def save_state():
         return True
 
     except Exception:
-        log.exception("V15 state save failed")
+        log.exception("V15.1 state save failed")
         return False
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        log.info("New V15 paper account")
+        log.info("New V15.1 paper account")
         return
 
     try:
@@ -295,7 +296,13 @@ def load_state():
                 state.get("balance"), START_BALANCE
             )
 
-            # Restore learning weights, including new V15 feature.
+            # Remove old MACD dashboard data during migration.
+            for symbol_data in state["symbols"].values():
+                if isinstance(symbol_data, dict):
+                    symbol_data.pop("macd", None)
+
+            # Restore learning weights.
+            # Old MACD weight is automatically ignored.
             saved_learning = saved.get("learning", {})
             if not isinstance(saved_learning, dict):
                 saved_learning = {}
@@ -354,7 +361,7 @@ def load_state():
 
             state["history"] = cleaned_history[:MAX_HISTORY]
 
-            # Restore open positions without silently discarding them.
+            # Restore open positions and repair missing SL/TP.
             restored_positions = []
 
             for position in state["positions"]:
@@ -374,24 +381,30 @@ def load_state():
                 if not isinstance(position["feature_snapshot"], dict):
                     position["feature_snapshot"] = {}
 
-                # Recover missing V15 stop/target levels for older positions.
                 entry = number(position.get("entry"))
                 side = position.get("side")
 
                 if entry > 0 and side in ("LONG", "SHORT"):
+                    distance = number(position.get("stop_distance"))
+
+                    if distance <= 0:
+                        distance = entry * MIN_STOP_PERCENT
+
                     if number(position.get("stop_loss")) <= 0:
                         position["stop_loss"] = (
-                            entry * (1 - STOP_LOSS)
+                            entry - distance
                             if side == "LONG"
-                            else entry * (1 + STOP_LOSS)
+                            else entry + distance
                         )
 
                     if number(position.get("take_profit")) <= 0:
                         position["take_profit"] = (
-                            entry * (1 + TAKE_PROFIT)
+                            entry + distance * REWARD_RISK
                             if side == "LONG"
-                            else entry * (1 - TAKE_PROFIT)
+                            else entry - distance * REWARD_RISK
                         )
+
+                    position["stop_distance"] = distance
 
                 if (
                     entry <= 0
@@ -415,7 +428,7 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V15 RESTORED | positions=%s | completed=%s",
+            "V15.1 RESTORED | positions=%s | completed=%s",
             len(state["positions"]),
             len(state["history"])
         )
@@ -423,7 +436,7 @@ def load_state():
         save_state()
 
     except Exception:
-        log.exception("V15 state loading failed")
+        log.exception("V15.1 state loading failed")
 
 
 def reset_daily():
@@ -618,8 +631,7 @@ def get_candles(symbol, interval, limit=200):
     if len(candles) < 60:
         raise ValueError("Insufficient candle history: " + symbol)
 
-    # Bybit normally includes the currently forming candle last.
-    # Exclude it so indicators use completed candles only.
+    # Keep completed candles only.
     candles = candles[:-1]
 
     if len(candles) < 55:
@@ -745,16 +757,6 @@ def rsi(values, period=14):
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
-
-
-def macd(values):
-    fast = ema(values, 12)
-    slow = ema(values, 26)
-
-    if fast is None or slow is None:
-        return 0.0
-
-    return fast - slow
 
 
 def bollinger(values, period=20):
@@ -886,7 +888,6 @@ def analyze_candles(candles):
         "ema21": e21,
         "ema50": e50,
         "rsi": rsi(closes),
-        "macd": macd(closes),
         "bb_upper": upper,
         "bb_middle": middle,
         "bb_lower": lower,
@@ -897,7 +898,7 @@ def analyze_candles(candles):
 
 
 # ============================================================
-# V15 SIGNAL ENGINE
+# V15.1 SIGNAL ENGINE - MACD REMOVED
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
@@ -926,7 +927,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
-    # Avoid chasing extreme RSI conditions.
+    # RSI
     if 50 <= five["rsi"] <= 68:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
@@ -934,14 +935,8 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
-    if five["macd"] > 0:
-        features["macd"] = 1
-        long_score += 8 * weights["macd"]
-    elif five["macd"] < 0:
-        features["macd"] = -1
-        short_score += 8 * weights["macd"]
-
-    if five["volume_ratio"] >= 1.15:
+    # Volume confirmation
+    if five["volume_ratio"] >= 1.05:
         if five["ema9"] > five["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
@@ -949,7 +944,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
             features["volume"] = -1
             short_score += 8 * weights["volume"]
 
-    # Order book is supporting evidence, not the main signal.
+    # Order book support
     if imbalance > 0.15:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
@@ -957,7 +952,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
-    # 15-minute confirmation
+    # 15-minute confirmation adds score but does not block entry.
     if fifteen["ema9"] > fifteen["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
@@ -965,7 +960,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    # 1-hour higher timeframe confirmation
+    # 1-hour trend adds score but is not a mandatory filter.
     if (
         hourly["ema9"] > hourly["ema21"]
         and hourly["ema21"] > hourly["ema50"]
@@ -980,8 +975,8 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
-    # Trend strength filter
-    if five["adx"] >= 18:
+    # ADX trend strength
+    if five["adx"] >= 16:
         if five["ema9"] > five["ema21"]:
             features["adx"] = 1
             long_score += 6 * weights["adx"]
@@ -989,7 +984,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
             features["adx"] = -1
             short_score += 6 * weights["adx"]
 
-    # Funding is a small contrarian factor.
+    # Funding - small contrarian factor.
     if funding > 0.0005:
         features["funding"] = -1
         short_score += 2 * weights["funding"]
@@ -997,6 +992,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["funding"] = 1
         long_score += 2 * weights["funding"]
 
+    # Open interest support
     if oi_change > 0.2:
         if five["ema9"] > five["ema21"]:
             features["open_interest"] = 1
@@ -1010,43 +1006,37 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
 
     signal = "WAIT"
 
+    # Core 5-minute entry conditions.
+    # 15m and 1h are already included in the score above.
     long_confirmed = (
         five["ema9"] > five["ema21"]
-        and five["ema21"] > five["ema50"]
-        and fifteen["ema9"] > fifteen["ema21"]
-        and hourly["ema9"] > hourly["ema21"]
-        and hourly["ema21"] > hourly["ema50"]
         and five["rsi"] >= 50
         and five["rsi"] <= 68
-        and five["adx"] >= 18
-        and five["volume_ratio"] >= 1.15
+        and five["adx"] >= 16
+        and five["volume_ratio"] >= 1.05
+        and five["price"] > five["ema21"]
     )
 
     short_confirmed = (
         five["ema9"] < five["ema21"]
-        and five["ema21"] < five["ema50"]
-        and fifteen["ema9"] < fifteen["ema21"]
-        and hourly["ema9"] < hourly["ema21"]
-        and hourly["ema21"] < hourly["ema50"]
         and five["rsi"] >= 32
         and five["rsi"] <= 50
-        and five["adx"] >= 18
-        and five["volume_ratio"] >= 1.15
+        and five["adx"] >= 16
+        and five["volume_ratio"] >= 1.05
+        and five["price"] < five["ema21"]
     )
 
     if (
         long_score >= ENTRY_SCORE
-        and long_score - short_score >= 15
+        and long_score - short_score >= 8
         and long_confirmed
-        and five["price"] > five["ema21"]
     ):
         signal = "LONG"
 
     elif (
         short_score >= ENTRY_SCORE
-        and short_score - long_score >= 15
+        and short_score - long_score >= 8
         and short_confirmed
-        and five["price"] < five["ema21"]
     ):
         signal = "SHORT"
 
@@ -1162,15 +1152,12 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if balance <= 0:
             return False
 
-        # ATR stop distance, with minimum and maximum limits.
         raw_stop = atr_value * ATR_STOP_MULTIPLIER
         minimum_stop = price * MIN_STOP_PERCENT
         maximum_stop = price * MAX_STOP_PERCENT
 
         stop_distance = max(raw_stop, minimum_stop)
 
-        # Skip unusually volatile conditions instead of forcing
-        # a stop that is too wide for the risk model.
         if stop_distance > maximum_stop:
             log.info(
                 "ENTRY SKIPPED | %s | ATR stop too wide",
@@ -1185,7 +1172,6 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
         quantity = risk_amount / stop_distance
 
-        # Maximum notional per paper position.
         max_notional = balance * MAX_EQUITY_EXPOSURE
         quantity = min(quantity, max_notional / price)
 
@@ -1375,7 +1361,6 @@ def close_paper_position(position, price, reason):
                 trade_id
             )
 
-    # Save the position removal and history insertion together.
     if not save_state():
         log.error(
             "CRITICAL: completed trade save failed | %s",
@@ -1445,7 +1430,6 @@ def monitor_positions():
                         changed = True
                         break
 
-            # Use the actual saved SL/TP prices shown on dashboard.
             if side == "LONG":
                 if price <= stop_price:
                     close_paper_position(
@@ -1587,7 +1571,6 @@ def scan_symbol(symbol):
         "symbol": symbol,
         "price": five["price"],
         "rsi": round(five["rsi"], 2),
-        "macd": round(five["macd"], 8),
         "adx": round(five["adx"], 2),
         "atr": round(five["atr"], 8),
         "ema9": round(five["ema9"], 8),
@@ -1635,7 +1618,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V15 worker started")
+    log.info("CoinSentra V15.1 worker started")
     last_private_check = 0.0
 
     while True:
@@ -1692,7 +1675,7 @@ def start_worker_once():
 
         thread = threading.Thread(
             target=background_worker,
-            name="CoinSentraV15Worker",
+            name="CoinSentraV15.1Worker",
             daemon=True
         )
 
@@ -1740,7 +1723,6 @@ def trade_statistics():
         gross_losses / losses if losses else 0.0
     )
 
-    # History is newest first. Rebuild the equity curve oldest first.
     chronological = list(reversed(pnls))
     running_equity = START_BALANCE
     peak_equity = START_BALANCE
@@ -1800,7 +1782,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V15</title>
+<title>CoinSentra Trading Brain V15.1</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -1830,7 +1812,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V15 | BYBIT | PAPER MODE ONLY</div>
+<div class="small">TRADING BRAIN V15.1 | BYBIT | PAPER MODE ONLY</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -1922,7 +1904,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 15.0 | 5m + 15m + 1h confirmation<br>
+Version 15.1 | 5m signals with 15m + 1h supporting confirmation<br>
 ATR stop | 1.8:1 target/risk | 10-minute re-entry cooldown<br>
 Paper trading only | Fee estimate 0.055% per side<br>
 Last scan: <span id="last">Waiting</span><br>
