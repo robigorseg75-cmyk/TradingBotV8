@@ -12,15 +12,16 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V14.2
+# COINSENTRA TRADING BRAIN V14.3
 # BYBIT | RENDER | PAPER TRADING ONLY
 # ADAPTIVE INDICATOR LEARNING
+# POSITION AND TRADE HISTORY RECOVERY FIX
 # ============================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("CoinSentraV14_2")
+log = logging.getLogger("CoinSentraV14_3")
 
 # ---------------- SETTINGS ----------------
 
@@ -45,7 +46,7 @@ CONFIRMATION_INTERVAL = "15"
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "14.2"
+VERSION = "14.3"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -175,10 +176,13 @@ def clean_trade(trade):
 
 def save_state():
     """
-    Save the complete state atomically.
-    storage_lock prevents two simultaneous saves from overwriting
-    each other's temporary file.
+    Atomic state save.
+
+    IMPORTANT:
+    Always acquire storage_lock before lock.
+    Never call this function while already holding lock.
     """
+
     try:
         with storage_lock:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -201,7 +205,8 @@ def save_state():
                     os.remove(temp_file)
 
         log.info(
-            "STATE SAVED | history=%s | learning_samples=%s | learning_updates=%s",
+            "STATE SAVED | positions=%s | history=%s | learning_samples=%s | learning_updates=%s",
+            len(snapshot.get("positions", [])),
             len(snapshot.get("history", [])),
             snapshot.get("learning", {}).get("samples", 0),
             snapshot.get("learning", {}).get("updates", 0)
@@ -210,13 +215,13 @@ def save_state():
         return True
 
     except Exception:
-        log.exception("V14.2 state save failed")
+        log.exception("V14.3 state save failed")
         return False
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        log.info("New V14.2 paper account")
+        log.info("New V14.3 paper account")
         return
 
     try:
@@ -290,9 +295,13 @@ def load_state():
             for item in state["history"]:
                 trade = clean_trade(item)
                 if not trade:
+                    log.warning(
+                        "INVALID HISTORY RECORD PRESERVED FOR REVIEW"
+                    )
                     continue
 
                 trade_id = trade["trade_id"]
+
                 if trade_id in seen:
                     continue
 
@@ -301,24 +310,42 @@ def load_state():
 
             state["history"] = cleaned[:MAX_HISTORY]
 
-            # Restore valid open paper positions.
+            # Restore open positions.
+            # Do not silently discard a position because its values
+            # are invalid. Preserve it and flag it for investigation.
             valid_positions = []
 
             for p in state["positions"]:
                 if not isinstance(p, dict):
-                    continue
-
-                if number(p.get("entry")) <= 0:
-                    continue
-
-                if number(p.get("quantity")) <= 0:
+                    log.error(
+                        "INVALID POSITION RECORD: non-dictionary record"
+                    )
                     continue
 
                 p.setdefault("opened", now_text())
-                p.setdefault("current_price", p["entry"])
+                p.setdefault("current_price", number(p.get("entry")))
                 p.setdefault("unrealized_pnl", 0.0)
                 p.setdefault("trade_id", uuid.uuid4().hex)
                 p.setdefault("feature_snapshot", {})
+
+                if not isinstance(p.get("feature_snapshot"), dict):
+                    p["feature_snapshot"] = {}
+
+                if (
+                    number(p.get("entry")) <= 0
+                    or number(p.get("quantity")) <= 0
+                ):
+                    p["state_error"] = (
+                        "Invalid saved entry or quantity - preserved"
+                    )
+
+                    log.error(
+                        "POSITION RECOVERY WARNING | ID=%s | SYMBOL=%s",
+                        p.get("trade_id"),
+                        p.get("symbol")
+                    )
+                else:
+                    p.pop("state_error", None)
 
                 valid_positions.append(p)
 
@@ -326,18 +353,17 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V14.2 RESTORED | positions=%s | completed=%s | samples=%s | updates=%s",
+            "V14.3 RESTORED | positions=%s | completed=%s | samples=%s | updates=%s",
             len(state["positions"]),
             len(state["history"]),
             state["learning"]["samples"],
             state["learning"]["updates"]
         )
 
-        # Rewrite normalized state after successful restoration.
         save_state()
 
     except Exception:
-        log.exception("V14.2 state loading failed")
+        log.exception("V14.3 state loading failed")
 
 
 def reset_daily():
@@ -395,7 +421,6 @@ def update_learning(trade):
     with lock:
         learning = state["learning"]
 
-        # Count this completed eligible trade.
         learning["samples"] = int(
             number(learning.get("samples"))
         ) + 1
@@ -403,7 +428,6 @@ def update_learning(trade):
         learning["last_result"] = "WIN" if outcome > 0 else "LOSS"
         learning["last_update"] = now_text()
 
-        # Use the most recent completed trades with valid features.
         eligible = []
 
         for item in state["history"]:
@@ -483,7 +507,6 @@ def update_learning(trade):
                 len(eligible), learning["updates"], weights
             )
 
-    # Persist the learning state immediately.
     save_state()
 
 
@@ -942,7 +965,7 @@ def open_paper_position(symbol, side, price, features=None):
         if len(state["positions"]) >= MAX_POSITIONS:
             return
 
-        if any(p["symbol"] == symbol for p in state["positions"]):
+        if any(p.get("symbol") == symbol for p in state["positions"]):
             return
 
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
@@ -1008,16 +1031,26 @@ def open_paper_position(symbol, side, price, features=None):
 
 
 # ============================================================
-# COMPLETED TRADE ENGINE - FIXED
+# COMPLETED TRADE ENGINE - V14.3 RECOVERY FIX
 # ============================================================
 
 def close_paper_position(position, price, reason):
     if not PAPER_TRADING:
         return False
 
-    with lock:
-        trade_id = position.get("trade_id")
+    if not isinstance(position, dict):
+        return False
 
+    trade_id = position.get("trade_id")
+
+    if not trade_id or price <= 0:
+        log.error("CLOSE FAILED: missing trade ID or invalid price")
+        return False
+
+    trade = None
+    already_completed = False
+
+    with lock:
         live = next(
             (
                 p for p in state["positions"]
@@ -1027,73 +1060,144 @@ def close_paper_position(position, price, reason):
         )
 
         if live is None:
-            log.warning("CLOSE SKIPPED: position already closed | %s", trade_id)
+            log.warning(
+                "CLOSE SKIPPED: position not found | %s",
+                trade_id
+            )
             return False
 
         entry = number(live.get("entry"))
         quantity = number(live.get("quantity"))
 
-        if price <= 0 or entry <= 0 or quantity <= 0:
-            log.error("CLOSE FAILED: invalid trade values | %s", trade_id)
+        if entry <= 0 or quantity <= 0:
+            log.error(
+                "CLOSE FAILED: invalid trade values | %s",
+                trade_id
+            )
+            live["state_error"] = "Cannot close: invalid entry or quantity"
             return False
 
-        # Prevent duplicate completed records.
-        if any(t.get("trade_id") == trade_id for t in state["history"]):
-            state["positions"].remove(live)
-            save_state()
-            return False
-
-        gross = position_gross_pnl(live, price)
-        fees = position_fees(live, price)
-        net = gross - fees
-        closed = now_text()
-
-        trade = {
-            "trade_id": trade_id,
-            "status": "COMPLETED",
-            "symbol": live["symbol"],
-            "side": live["side"],
-            "entry": entry,
-            "exit": price,
-            "quantity": quantity,
-            "notional": live.get("notional", entry * quantity),
-            "leverage": live.get("leverage", LEVERAGE),
-            "margin": live.get("margin", 0),
-            "gross_pnl": round(gross, 6),
-            "fees": round(fees, 6),
-            "pnl": round(net, 6),
-            "net_pnl": round(net, 6),
-            "reason": reason,
-            "opened": live.get("opened", ""),
-            "closed": closed,
-            "feature_snapshot": dict(live.get("feature_snapshot", {}))
-        }
-
-        # Record the completed trade before updating learning.
-        state["history"].insert(0, trade)
-        state["history"] = state["history"][:MAX_HISTORY]
-
-        state["balance"] += net
-        state["daily_pnl"] += net
-        state["positions"].remove(live)
-
-        if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
-            state["running"] = False
-
-        log.info(
-            "COMPLETED TRADE SAVED | %s | %s | Gross %.4f | Fees %.4f | Net %.4f",
-            live["symbol"], reason, gross, fees, net
+        # Check whether a valid completed record already exists.
+        existing = next(
+            (
+                t for t in state["history"]
+                if isinstance(t, dict)
+                and t.get("trade_id") == trade_id
+            ),
+            None
         )
 
-    # Persist completed trade first, so it is not lost if learning fails.
-    save_state()
+        if existing is not None:
+            valid_existing = clean_trade(existing)
+
+            if valid_existing is not None:
+                # A valid completed record already exists.
+                # Reconcile the duplicate open position, but do not
+                # create another trade or apply PNL a second time.
+                state["positions"].remove(live)
+                already_completed = True
+
+                log.warning(
+                    "POSITION RECONCILED | existing completed trade found | %s",
+                    trade_id
+                )
+
+            else:
+                # The existing record is incomplete.
+                # Remove only the malformed record, then create a
+                # complete record from the still-open position.
+                state["history"] = [
+                    t for t in state["history"]
+                    if not (
+                        isinstance(t, dict)
+                        and t.get("trade_id") == trade_id
+                    )
+                ]
+
+                log.error(
+                    "REPAIRING INCOMPLETE HISTORY RECORD | %s",
+                    trade_id
+                )
+
+        if already_completed:
+            trade = None
+
+        else:
+            gross = position_gross_pnl(live, price)
+            fees = position_fees(live, price)
+            net = gross - fees
+            closed = now_text()
+
+            trade = {
+                "trade_id": trade_id,
+                "status": "COMPLETED",
+                "symbol": live.get("symbol", "UNKNOWN"),
+                "side": live.get("side", "UNKNOWN"),
+                "entry": entry,
+                "exit": price,
+                "quantity": quantity,
+                "notional": live.get("notional", entry * quantity),
+                "leverage": live.get("leverage", LEVERAGE),
+                "margin": live.get("margin", 0),
+                "gross_pnl": round(gross, 6),
+                "fees": round(fees, 6),
+                "pnl": round(net, 6),
+                "net_pnl": round(net, 6),
+                "reason": reason,
+                "opened": live.get("opened", ""),
+                "closed": closed,
+                "feature_snapshot": dict(
+                    live.get("feature_snapshot", {})
+                )
+            }
+
+            # Save the completed trade and remove the open position
+            # together in the same locked state update.
+            state["history"].insert(0, trade)
+            state["history"] = state["history"][:MAX_HISTORY]
+
+            state["balance"] += net
+            state["daily_pnl"] += net
+
+            state["positions"].remove(live)
+
+            live.pop("state_error", None)
+
+            if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
+                state["running"] = False
+
+            log.info(
+                "COMPLETED TRADE SAVED | %s | %s | Gross %.4f | Fees %.4f | Net %.4f | ID %s",
+                live.get("symbol"),
+                reason,
+                gross,
+                fees,
+                net,
+                trade_id
+            )
+
+    # IMPORTANT: save only AFTER releasing lock.
+    # This prevents the previous lock-order deadlock.
+    saved = save_state()
+
+    if not saved:
+        log.error(
+            "CRITICAL: completed trade state save failed | %s",
+            trade_id
+        )
+        return False
+
+    if already_completed:
+        return True
 
     try:
         update_learning(trade)
     except Exception:
-        log.exception("Learning update failed for trade %s", trade_id)
+        log.exception(
+            "Learning update failed for trade %s",
+            trade_id
+        )
 
-    # Save the final state again after learning.
     save_state()
 
     return True
@@ -1111,11 +1215,20 @@ def monitor_positions():
 
     for position in positions:
         try:
+            # Preserve invalid positions instead of removing them.
+            if (
+                number(position.get("entry")) <= 0
+                or number(position.get("quantity")) <= 0
+            ):
+                log.error(
+                    "MONITOR SKIPPED INVALID POSITION | %s | %s",
+                    position.get("symbol"),
+                    position.get("trade_id")
+                )
+                continue
+
             price = get_price(position["symbol"])
             entry = number(position["entry"])
-
-            if entry <= 0:
-                continue
 
             direction = 1 if position["side"] == "LONG" else -1
 
@@ -1130,17 +1243,26 @@ def monitor_positions():
                         live["gross_unrealized_pnl"] = round(
                             position_gross_pnl(live, price), 6
                         )
+                        live.pop("state_error", None)
                         changed = True
                         break
 
             if gross_change >= TAKE_PROFIT:
-                close_paper_position(position, price, "TAKE PROFIT")
+                close_paper_position(
+                    position, price, "TAKE PROFIT"
+                )
 
             elif gross_change <= -STOP_LOSS:
-                close_paper_position(position, price, "STOP LOSS")
+                close_paper_position(
+                    position, price, "STOP LOSS"
+                )
 
         except Exception as e:
-            log.warning("Monitor error %s: %s", position["symbol"], e)
+            log.warning(
+                "Monitor error %s: %s",
+                position.get("symbol"),
+                e
+            )
 
     if changed:
         save_state()
@@ -1266,7 +1388,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V14.2 worker started")
+    log.info("CoinSentra V14.3 worker started")
     last_private_check = 0
 
     while True:
@@ -1322,7 +1444,7 @@ def start_worker_once():
 
         thread = threading.Thread(
             target=background_worker,
-            name="CoinSentraV14_2Worker",
+            name="CoinSentraV14_3Worker",
             daemon=True
         )
 
@@ -1385,7 +1507,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V14.2</title>
+<title>CoinSentra Trading Brain V14.3</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -1415,7 +1537,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V14.2 | BYBIT | PAPER MODE ONLY</div>
+<div class="small">TRADING BRAIN V14.3 | BYBIT | PAPER MODE ONLY</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -1504,7 +1626,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 14.2 | 5m + 15m confirmation | 8x simulated leverage<br>
+Version 14.3 | 5m + 15m confirmation | 8x simulated leverage<br>
 Take Profit 2% | Stop Loss 2% | Daily loss limit $6<br>
 Fee estimate: 0.055% per side<br>
 Last scan: <span id="last">Waiting</span><br>
