@@ -16,6 +16,7 @@ from pybit.unified_trading import HTTP
 # BYBIT | RENDER | PAPER TRADING ONLY
 # ADAPTIVE LEARNING | ATR STOPS | COOLDOWN | TRADE RECOVERY
 # MACD REMOVED | FASTER SIGNAL ENGINE
+# HISTORY + LEARNING PERSISTENCE FIX
 # ============================================================
 
 app = Flask(__name__)
@@ -75,6 +76,13 @@ LEARNING_FEATURES = [
 DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 
 # ---------------- STORAGE ----------------
+#
+# IMPORTANT:
+# On Render, set DATA_DIR to your persistent disk mount path.
+# Example: DATA_DIR=/var/data
+#
+# If no persistent disk is attached, /tmp is temporary and
+# data can be lost when Render restarts the service.
 
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
 STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v15.json")
@@ -100,7 +108,8 @@ if API_KEY and API_SECRET:
 lock = threading.RLock()
 storage_lock = threading.Lock()
 worker_lock = threading.Lock()
-worker_started = False
+
+worker_thread = None
 
 state = {
     "balance": START_BALANCE,
@@ -123,7 +132,8 @@ state = {
         "samples": 0,
         "updates": 0,
         "last_update": None,
-        "last_result": "Waiting for completed trades"
+        "last_result": "Waiting for completed trades",
+        "processed_trade_ids": []
     }
 }
 
@@ -246,9 +256,10 @@ def save_state():
                     os.remove(temp_file)
 
         log.info(
-            "STATE SAVED | positions=%s | history=%s",
+            "STATE SAVED | positions=%s | history=%s | learning_samples=%s",
             len(snapshot.get("positions", [])),
-            len(snapshot.get("history", []))
+            len(snapshot.get("history", [])),
+            snapshot.get("learning", {}).get("samples", 0)
         )
 
         return True
@@ -301,8 +312,7 @@ def load_state():
                 if isinstance(symbol_data, dict):
                     symbol_data.pop("macd", None)
 
-            # Restore learning weights.
-            # Old MACD weight is automatically ignored.
+            # Restore learning weights and learning persistence.
             saved_learning = saved.get("learning", {})
             if not isinstance(saved_learning, dict):
                 saved_learning = {}
@@ -325,22 +335,6 @@ def load_state():
                     4
                 )
 
-            state["learning"] = {
-                "enabled": LEARNING_ENABLED,
-                "weights": weights,
-                "samples": max(
-                    0, safe_int(saved_learning.get("samples"))
-                ),
-                "updates": max(
-                    0, safe_int(saved_learning.get("updates"))
-                ),
-                "last_update": saved_learning.get("last_update"),
-                "last_result": saved_learning.get(
-                    "last_result",
-                    "Waiting for completed trades"
-                )
-            }
-
             # Clean and deduplicate completed history.
             cleaned_history = []
             seen_ids = set()
@@ -360,6 +354,62 @@ def load_state():
                 cleaned_history.append(trade)
 
             state["history"] = cleaned_history[:MAX_HISTORY]
+
+            # Find all eligible historical learning trades.
+            eligible_history = []
+
+            for trade in state["history"]:
+                snapshot = trade.get("feature_snapshot")
+
+                if not isinstance(snapshot, dict) or not snapshot:
+                    continue
+
+                if number(trade.get("pnl")) == 0:
+                    continue
+
+                eligible_history.append(trade)
+
+            # Restore IDs already processed by learning.
+            saved_processed = saved_learning.get(
+                "processed_trade_ids", []
+            )
+
+            if not isinstance(saved_processed, list):
+                saved_processed = []
+
+            processed_ids = {
+                str(item) for item in saved_processed if item
+            }
+
+            # Migration protection:
+            # Existing completed trades are marked as processed.
+            # This prevents old trades from being learned repeatedly
+            # after every restart.
+            if "processed_trade_ids" not in saved_learning:
+                processed_ids.update(
+                    str(t["trade_id"]) for t in eligible_history
+                )
+
+            state["learning"] = {
+                "enabled": LEARNING_ENABLED,
+                "weights": weights,
+
+                # Always derive samples from actual eligible history.
+                "samples": len(eligible_history),
+
+                "updates": max(
+                    0, safe_int(saved_learning.get("updates"))
+                ),
+
+                "last_update": saved_learning.get("last_update"),
+
+                "last_result": saved_learning.get(
+                    "last_result",
+                    "Waiting for completed trades"
+                ),
+
+                "processed_trade_ids": list(processed_ids)[-MAX_HISTORY:]
+            }
 
             # Restore open positions and repair missing SL/TP.
             restored_positions = []
@@ -428,9 +478,10 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V15.1 RESTORED | positions=%s | completed=%s",
+            "V15.1 RESTORED | positions=%s | completed=%s | learning_samples=%s",
             len(state["positions"]),
-            len(state["history"])
+            len(state["history"]),
+            state["learning"]["samples"]
         )
 
         save_state()
@@ -469,29 +520,36 @@ def learning_snapshot_for_side(features, side):
 
 
 def update_learning(trade):
+    """
+    Rebuild sample count from completed history.
+    Process each completed trade ID only once.
+    """
+
     if not LEARNING_ENABLED or not isinstance(trade, dict):
         return
 
-    features = trade.get("feature_snapshot")
+    trade_id = str(trade.get("trade_id", "")).strip()
 
-    if not isinstance(features, dict) or not features:
-        log.warning("LEARNING SKIPPED: missing feature snapshot")
+    if not trade_id:
+        log.warning("LEARNING SKIPPED: missing trade ID")
         return
-
-    pnl = number(trade.get("pnl"))
-
-    if pnl == 0:
-        return
-
-    outcome = 1.0 if pnl > 0 else -1.0
 
     with lock:
         learning = state["learning"]
 
-        learning["samples"] = safe_int(
-            learning.get("samples")
-        ) + 1
+        # Prevent duplicate training for the same completed trade.
+        processed_ids = set(
+            str(x) for x in learning.get("processed_trade_ids", [])
+        )
 
+        if trade_id in processed_ids:
+            log.info(
+                "LEARNING ALREADY PROCESSED | %s",
+                trade_id
+            )
+            return
+
+        # Build eligible samples from the actual completed history.
         eligible = []
 
         for item in state["history"]:
@@ -508,12 +566,32 @@ def update_learning(trade):
             if item_pnl == 0:
                 continue
 
+            item_id = str(item.get("trade_id", ""))
+
+            if not item_id:
+                continue
+
             eligible.append({
+                "trade_id": item_id,
                 "features": snapshot,
                 "outcome": 1.0 if item_pnl > 0 else -1.0
             })
 
+        # Keep the most recent learning window.
         eligible = eligible[:LEARNING_WINDOW]
+
+        # The displayed sample count comes from history, not a counter.
+        learning["samples"] = len(eligible)
+
+        # Mark this trade as processed even if fewer than 10 samples exist.
+        # It will not be counted or trained again after a restart.
+        processed_ids.add(trade_id)
+
+        learning["processed_trade_ids"] = list(
+            processed_ids
+        )[-MAX_HISTORY:]
+
+        outcome = 1.0 if number(trade.get("pnl")) > 0 else -1.0
 
         if len(eligible) < LEARNING_MIN_SAMPLES:
             learning["last_result"] = (
@@ -521,6 +599,15 @@ def update_learning(trade):
                 if outcome > 0
                 else "LOSS - collecting samples"
             )
+
+            learning["last_update"] = now_text()
+
+            log.info(
+                "LEARNING COLLECTING | samples=%s/%s",
+                len(eligible),
+                LEARNING_MIN_SAMPLES
+            )
+
         else:
             weights = dict(learning["weights"])
 
@@ -531,6 +618,7 @@ def update_learning(trade):
                     value = number(
                         sample["features"].get(name)
                     )
+
                     values.append(value * sample["outcome"])
 
                 correlation = (
@@ -552,6 +640,7 @@ def update_learning(trade):
                 )
 
             learning["weights"] = weights
+
             learning["updates"] = safe_int(
                 learning.get("updates")
             ) + 1
@@ -562,7 +651,14 @@ def update_learning(trade):
                 else "LOSS - weights updated"
             )
 
-        learning["last_update"] = now_text()
+            learning["last_update"] = now_text()
+
+            log.info(
+                "LEARNING UPDATED | samples=%s | updates=%s | trade=%s",
+                len(eligible),
+                learning["updates"],
+                trade_id
+            )
 
     save_state()
 
@@ -1006,8 +1102,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
 
     signal = "WAIT"
 
-    # Core 5-minute entry conditions.
-    # 15m and 1h are already included in the score above.
     long_confirmed = (
         five["ema9"] > five["ema21"]
         and five["rsi"] >= 50
@@ -1667,20 +1761,26 @@ def background_worker():
 
 
 def start_worker_once():
-    global worker_started
+    """
+    Start one worker thread per Gunicorn process.
+    Use one Gunicorn worker in Render.
+    """
+
+    global worker_thread
 
     with worker_lock:
-        if worker_started:
+        if worker_thread is not None and worker_thread.is_alive():
             return
 
-        thread = threading.Thread(
+        worker_thread = threading.Thread(
             target=background_worker,
             name="CoinSentraV15.1Worker",
             daemon=True
         )
 
-        thread.start()
-        worker_started = True
+        worker_thread.start()
+
+        log.info("BACKGROUND WORKER START REQUESTED")
 
 
 # ============================================================
@@ -2234,9 +2334,11 @@ def start():
 
 load_state()
 
-if __name__ == "__main__":
-    start_worker_once()
+# Start the worker when the app is imported by Gunicorn as well
+# as when it is launched directly with Python.
+start_worker_once()
 
+if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8080))
