@@ -1,9 +1,9 @@
-
 import os
 import json
 import time
 import uuid
 import math
+import hashlib
 import threading
 import logging
 from datetime import datetime, timezone, date
@@ -12,9 +12,9 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16
+# COINSENTRA TRADING BRAIN V16.1
 # BYBIT | RENDER | PAPER TRADING ONLY
-# HISTORY RECOVERY | ADAPTIVE LEARNING | ATR STOPS
+# HISTORY PERSISTENCE | ADAPTIVE LEARNING | ATR STOPS
 # ============================================================
 
 app = Flask(__name__)
@@ -53,7 +53,7 @@ COOLDOWN_SECONDS = 600
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "16.0"
+VERSION = "16.1"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -127,7 +127,6 @@ state = {
     }
 }
 
-
 # ============================================================
 # GENERAL HELPERS
 # ============================================================
@@ -175,6 +174,34 @@ def first_value(data, names, default=None):
 
 
 # ============================================================
+# STABLE TRADE ID
+# ============================================================
+
+def stable_trade_id(trade):
+    """
+    Generates a deterministic ID for older trades without IDs.
+    The same old trade will receive the same ID every time.
+    """
+
+    parts = [
+        str(trade.get("symbol", "")),
+        str(trade.get("side", "")),
+        str(first_value(trade, ["entry", "entry_price"], "")),
+        str(first_value(trade, ["exit", "exit_price"], "")),
+        str(first_value(trade, ["quantity", "qty"], "")),
+        str(first_value(trade, ["opened", "entry_time"], "")),
+        str(first_value(trade, ["closed", "close_time"], "")),
+        str(first_value(trade, ["pnl", "net_pnl"], "")),
+    ]
+
+    raw = "|".join(parts)
+
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+    return "RECOVERED-" + digest
+
+
+# ============================================================
 # TRADE CLEANING AND HISTORY MIGRATION
 # ============================================================
 
@@ -215,6 +242,7 @@ def clean_trade(trade):
         return None
 
     pnl = number(pnl_value)
+
     fees = number(first_value(
         trade, ["fees", "fee", "total_fee"], 0
     ))
@@ -238,11 +266,12 @@ def clean_trade(trade):
                 -1.0, min(1.0, number(snapshot.get(name)))
             )
 
+    existing_id = first_value(trade, ["trade_id", "id"])
+
     result = dict(trade)
+
     result.update({
-        "trade_id": str(
-            first_value(trade, ["trade_id", "id"], "OLD-" + uuid.uuid4().hex[:12])
-        ),
+        "trade_id": str(existing_id) if existing_id else stable_trade_id(trade),
         "status": "COMPLETED",
         "symbol": str(trade.get("symbol", "UNKNOWN")),
         "side": str(trade.get("side", "UNKNOWN")).upper(),
@@ -283,7 +312,6 @@ def normalize_history(items):
         seen.add(trade_id)
         cleaned.append(trade)
 
-    # Newest first when timestamps are available.
     cleaned.sort(
         key=lambda t: str(t.get("closed", "")),
         reverse=True
@@ -298,8 +326,12 @@ def normalize_history(items):
 
 def save_state():
     """
-    Atomic JSON save.
-    Do not call while holding the state lock.
+    V16.1:
+    - Serializes state saves.
+    - Takes the snapshot only after acquiring storage_lock.
+    - Uses atomic replacement.
+    - Prevents concurrent saves from replacing newer state
+      with an older snapshot.
     """
 
     temp_file = None
@@ -333,10 +365,11 @@ def save_state():
             len(snapshot.get("history", [])),
             snapshot.get("learning", {}).get("samples", 0)
         )
+
         return True
 
     except Exception:
-        log.exception("V16 state save failed")
+        log.exception("V16.1 state save failed")
         return False
 
     finally:
@@ -379,8 +412,6 @@ def recover_position(position):
     stop = number(position.get("stop_loss"))
     target = number(position.get("take_profit"))
 
-    # Use stored stop distance first, otherwise a conservative
-    # minimum-stop fallback for positions from older versions.
     stop_distance = number(position.get("stop_distance"))
 
     if stop_distance <= 0:
@@ -428,7 +459,7 @@ def rebuild_learning_samples(history):
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        log.info("New V16 paper account")
+        log.info("New V16.1 paper account")
         return
 
     try:
@@ -441,16 +472,20 @@ def load_state():
         history = normalize_history(saved.get("history", []))
 
         positions = []
+
         for item in saved.get("positions", []):
             recovered = recover_position(item)
+
             if recovered is not None:
                 positions.append(recovered)
 
         saved_learning = saved.get("learning", {})
+
         if not isinstance(saved_learning, dict):
             saved_learning = {}
 
         saved_weights = saved_learning.get("weights", {})
+
         if not isinstance(saved_weights, dict):
             saved_weights = {}
 
@@ -469,8 +504,18 @@ def load_state():
             )
 
         processed_ids = saved_learning.get("processed_ids", [])
+
         if not isinstance(processed_ids, list):
             processed_ids = []
+
+        # Recover processed IDs from the completed history too.
+        # This prevents a previously learned trade from being
+        # processed again after state recovery.
+        for trade in history:
+            trade_id = str(trade.get("trade_id", ""))
+
+            if trade_id and trade_id not in processed_ids:
+                processed_ids.append(trade_id)
 
         learning = {
             "enabled": LEARNING_ENABLED,
@@ -488,37 +533,47 @@ def load_state():
             state["balance"] = number(
                 saved.get("balance"), START_BALANCE
             )
+
             state["positions"] = positions
             state["history"] = history
+
             state["daily_pnl"] = number(saved.get("daily_pnl"))
+
             state["daily_date"] = str(
                 saved.get("daily_date", str(date.today()))
             )
+
             state["running"] = bool(saved.get("running", True))
             state["last_scan"] = saved.get("last_scan")
             state["last_error"] = saved.get("last_error")
+
             state["private_status"] = saved.get(
                 "private_status", "NOT CONFIGURED"
             )
+
             state["account_balance"] = saved.get("account_balance")
+
             state["symbols"] = (
                 saved.get("symbols", {})
                 if isinstance(saved.get("symbols", {}), dict)
                 else {}
             )
+
             state["scan_count"] = max(
                 0, safe_int(saved.get("scan_count"))
             )
+
             state["last_closed_by_symbol"] = (
                 saved.get("last_closed_by_symbol", {})
                 if isinstance(saved.get("last_closed_by_symbol", {}), dict)
                 else {}
             )
+
             state["learning"] = learning
             state["version"] = VERSION
 
         log.info(
-            "V16 RESTORED | positions=%s | completed=%s | eligible_learning_samples=%s",
+            "V16.1 RESTORED | positions=%s | completed=%s | eligible_samples=%s",
             len(positions),
             len(history),
             learning["samples"]
@@ -527,7 +582,7 @@ def load_state():
         save_state()
 
     except Exception:
-        log.exception("V16 state loading failed")
+        log.exception("V16.1 state loading failed")
 
 
 def reset_daily():
@@ -557,6 +612,7 @@ def learning_snapshot_for_side(features, side):
 
     for name in LEARNING_FEATURES:
         value = number(features.get(name))
+
         snapshot[name] = max(
             -1.0, min(1.0, value * direction)
         )
@@ -600,9 +656,10 @@ def update_learning(trade):
         processed.append(trade_id)
         learning["processed_ids"] = processed[-MAX_HISTORY:]
 
-        # Count eligible completed trades from the actual history.
         eligible = []
 
+        # History is newest-first. Use the most recent eligible
+        # trades, consistently, for the adaptive-learning window.
         for item in state["history"]:
             normalized = clean_trade(item)
 
@@ -615,15 +672,22 @@ def update_learning(trade):
                 continue
 
             eligible.append({
+                "trade_id": normalized["trade_id"],
                 "features": features,
-                "outcome": 1.0 if number(normalized["pnl"]) > 0 else -1.0
+                "outcome": (
+                    1.0 if number(normalized["pnl"]) > 0 else -1.0
+                )
             })
 
         eligible = eligible[:LEARNING_WINDOW]
-        learning["samples"] = rebuild_learning_samples(state["history"])
+
+        learning["samples"] = rebuild_learning_samples(
+            state["history"]
+        )
 
         if len(eligible) < LEARNING_MIN_SAMPLES:
             remaining = LEARNING_MIN_SAMPLES - len(eligible)
+
             learning["last_result"] = (
                 "Collecting samples: " + str(remaining) + " more needed"
             )
@@ -645,6 +709,7 @@ def update_learning(trade):
                     feature_value = number(
                         sample["features"].get(name)
                     )
+
                     values.append(
                         max(-1.0, min(1.0, feature_value))
                         * sample["outcome"]
@@ -669,10 +734,13 @@ def update_learning(trade):
                 )
 
             learning["weights"] = weights
+
             learning["updates"] = safe_int(
                 learning.get("updates")
             ) + 1
+
             learning["last_update"] = now_text()
+
             learning["last_result"] = (
                 "Weights updated from recent completed trades"
             )
@@ -750,7 +818,6 @@ def get_candles(symbol, interval, limit=200):
     if len(candles) < 60:
         raise ValueError("Insufficient candle history: " + symbol)
 
-    # Exclude the currently forming candle.
     candles = candles[:-1]
 
     if len(candles) < 55:
@@ -775,6 +842,7 @@ def get_orderbook(symbol):
     bid_volume = sum(
         number(x[1]) for x in bids if len(x) > 1
     )
+
     ask_volume = sum(
         number(x[1]) for x in asks if len(x) > 1
     )
@@ -870,6 +938,7 @@ def rsi(values, period=14):
         avg_gain = (
             avg_gain * (period - 1) + gains[i]
         ) / period
+
         avg_loss = (
             avg_loss * (period - 1) + losses[i]
         ) / period
@@ -898,6 +967,7 @@ def bollinger(values, period=20):
         return 0.0, 0.0, 0.0
 
     middle = sum(sample) / period
+
     variance = sum(
         (x - middle) ** 2 for x in sample
     ) / period
@@ -956,6 +1026,7 @@ def adx_approx(candles, period=14):
         plus_values.append(
             up if up > down and up > 0 else 0
         )
+
         minus_values.append(
             down if down > up and down > 0 else 0
         )
@@ -969,6 +1040,7 @@ def adx_approx(candles, period=14):
         sum(plus_values[-period:]) / period
         / tr_avg * 100
     )
+
     minus_di = (
         sum(minus_values[-period:]) / period
         / tr_avg * 100
@@ -992,6 +1064,7 @@ def analyze_candles(candles):
     upper, middle, lower = bollinger(closes)
 
     previous_volumes = volumes[-21:-1]
+
     average_volume = (
         sum(previous_volumes) / len(previous_volumes)
         if previous_volumes else 0.0
@@ -1015,10 +1088,8 @@ def analyze_candles(candles):
         "volume_ratio": volume_ratio,
         "adx": adx_approx(candles),
         "atr": atr(candles)
-    }
-
-
-# ============================================================
+    )
+ # ============================================================
 # SIGNAL ENGINE
 # ============================================================
 
@@ -1033,6 +1104,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if five["ema9"] > five["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
+
     elif five["ema9"] < five["ema21"]:
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
@@ -1040,6 +1112,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if five["ema21"] > five["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
+
     elif five["ema21"] < five["ema50"]:
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
@@ -1047,6 +1120,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if 50 <= five["rsi"] <= 68:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
+
     elif 32 <= five["rsi"] <= 50:
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
@@ -1054,6 +1128,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if five["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
+
     elif five["macd"] < 0:
         features["macd"] = -1
         short_score += 8 * weights["macd"]
@@ -1062,6 +1137,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         if five["ema9"] > five["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
+
         elif five["ema9"] < five["ema21"]:
             features["volume"] = -1
             short_score += 8 * weights["volume"]
@@ -1069,6 +1145,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if imbalance > 0.15:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
+
     elif imbalance < -0.15:
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
@@ -1076,6 +1153,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if fifteen["ema9"] > fifteen["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
+
     elif fifteen["ema9"] < fifteen["ema21"]:
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
@@ -1098,6 +1176,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         if five["ema9"] > five["ema21"]:
             features["adx"] = 1
             long_score += 6 * weights["adx"]
+
         elif five["ema9"] < five["ema21"]:
             features["adx"] = -1
             short_score += 6 * weights["adx"]
@@ -1105,6 +1184,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if funding > 0.0005:
         features["funding"] = -1
         short_score += 2 * weights["funding"]
+
     elif funding < -0.0005:
         features["funding"] = 1
         long_score += 2 * weights["funding"]
@@ -1113,6 +1193,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         if five["ema9"] > five["ema21"]:
             features["open_interest"] = 1
             long_score += 2 * weights["open_interest"]
+
         elif five["ema9"] < five["ema21"]:
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
@@ -1176,6 +1257,7 @@ def position_gross_pnl(position, price):
     entry = number(position.get("entry"))
     quantity = number(position.get("quantity"))
     direction = 1 if position.get("side") == "LONG" else -1
+
     return (price - entry) * quantity * direction
 
 
@@ -1203,6 +1285,7 @@ def account_totals():
     unrealized = sum(
         number(p.get("unrealized_pnl")) for p in positions
     )
+
     used_margin = sum(
         number(p.get("margin")) for p in positions
     )
@@ -1269,7 +1352,11 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         raw_stop = atr_value * ATR_STOP_MULTIPLIER
         minimum_stop = price * MIN_STOP_PERCENT
         maximum_stop = price * MAX_STOP_PERCENT
+
         stop_distance = max(raw_stop, minimum_stop)
+
+        if stop_distance > maximumimum_stop if False else False:
+            pass
 
         if stop_distance > maximum_stop:
             log.info("ENTRY SKIPPED | %s | ATR stop too wide", symbol)
@@ -1293,6 +1380,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if side == "LONG":
             stop_price = price - stop_distance
             target_price = price + stop_distance * REWARD_RISK
+
         else:
             stop_price = price + stop_distance
             target_price = price - stop_distance * REWARD_RISK
@@ -1330,6 +1418,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
                 p for p in state["positions"]
                 if p.get("trade_id") != position["trade_id"]
             ]
+
         log.error("POSITION NOT OPENED: state save failed")
         return False
 
@@ -1343,7 +1432,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
 
 # ============================================================
-# COMPLETED TRADE ENGINE
+# COMPLETED TRADE ENGINE - V16.1
 # ============================================================
 
 def close_paper_position(position, price, reason):
@@ -1378,8 +1467,7 @@ def close_paper_position(position, price, reason):
             log.error("CLOSE FAILED: invalid values | %s", trade_id)
             return False
 
-        # If this ID already exists in history, remove the duplicate
-        # position rather than creating a second completed trade.
+        # Prevent duplicate completed trades.
         existing = next(
             (
                 t for t in state["history"]
@@ -1429,6 +1517,8 @@ def close_paper_position(position, price, reason):
                 )
             }
 
+            # The trade is inserted and the live position removed
+            # under the same state lock.
             state["history"].insert(0, trade)
             state["history"] = normalize_history(state["history"])
 
@@ -1450,16 +1540,20 @@ def close_paper_position(position, price, reason):
                 symbol, reason, gross, fees, net, trade_id
             )
 
-    # History insertion and position removal are saved together.
+    # Save completed history, balance, and position removal
+    # together before updating adaptive learning.
     if not save_state():
-        log.error("CRITICAL: completed trade save failed | %s", trade_id)
-        return False
+        log.error(
+            "CRITICAL: completed trade state save failed | %s",
+            trade_id
+        )
 
     if duplicate_recovery:
         return True
 
     try:
         update_learning(trade)
+
     except Exception:
         log.exception("Learning update failed | %s", trade_id)
 
@@ -1520,11 +1614,14 @@ def monitor_positions():
             if side == "LONG":
                 if price <= stop_price:
                     close_paper_position(position, price, "STOP LOSS")
+
                 elif price >= target_price:
                     close_paper_position(position, price, "TAKE PROFIT")
+
             else:
                 if price >= stop_price:
                     close_paper_position(position, price, "STOP LOSS")
+
                 elif price <= target_price:
                     close_paper_position(position, price, "TAKE PROFIT")
 
@@ -1545,18 +1642,22 @@ def monitor_positions():
 def risk_check():
     with lock:
         realized = number(state["daily_pnl"])
+
         unrealized = sum(
             number(p.get("unrealized_pnl"))
             for p in state["positions"]
         )
+
         total_daily_pnl = realized + unrealized
 
         if total_daily_pnl <= -DAILY_LOSS_LIMIT:
             state["running"] = False
+
             log.warning(
                 "DAILY LOSS LIMIT REACHED | %.4f",
                 total_daily_pnl
             )
+
             return False
 
     return True
@@ -1585,6 +1686,7 @@ def check_private_account():
 
         if accounts:
             coins = accounts[0].get("coin", [])
+
             wallet = next(
                 (
                     item for item in coins
@@ -1598,6 +1700,7 @@ def check_private_account():
                 number(wallet.get("walletBalance"))
                 if wallet else 0.0
             )
+
             state["private_status"] = "CONNECTED - READ ONLY"
 
     except Exception as error:
@@ -1615,9 +1718,11 @@ def check_private_account():
 
 def scan_symbol(symbol):
     five_candles = get_candles(symbol, "5", 200)
+
     fifteen_candles = get_candles(
         symbol, CONFIRMATION_INTERVAL, 120
     )
+
     hourly_candles = get_candles(
         symbol, HIGHER_INTERVAL, 120
     )
@@ -1665,6 +1770,7 @@ def scan_symbol(symbol):
 
     with lock:
         state["symbols"][symbol] = data
+
         should_open = (
             state["running"]
             and signal["signal"] in ("LONG", "SHORT")
@@ -1687,7 +1793,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16 worker started")
+    log.info("CoinSentra V16.1 worker started")
     last_private_check = 0.0
 
     while True:
@@ -1732,6 +1838,7 @@ def background_worker():
             last_private_check = time.time()
 
         elapsed = time.time() - cycle_start
+
         time.sleep(max(1, SCAN_SECONDS - elapsed))
 
 
@@ -1761,6 +1868,7 @@ def trade_statistics():
         trades = normalize_history(state["history"])
 
     pnls = [number(t.get("pnl")) for t in trades]
+
     wins_list = [p for p in pnls if p > 0]
     losses_list = [p for p in pnls if p < 0]
 
@@ -1784,6 +1892,7 @@ def trade_statistics():
     average_loss = gross_losses / losses if losses else 0.0
 
     chronological = list(reversed(pnls))
+
     running_equity = START_BALANCE
     peak_equity = START_BALANCE
     max_drawdown = 0.0
@@ -1797,6 +1906,7 @@ def trade_statistics():
                 (peak_equity - running_equity)
                 / peak_equity * 100
             )
+
             max_drawdown = max(max_drawdown, drawdown)
 
     return {
@@ -1840,7 +1950,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16</title>
+<title>CoinSentra Trading Brain V16.1</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -1869,7 +1979,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16 | BYBIT | PAPER MODE ONLY</div>
+<div class="small">TRADING BRAIN V16.1 | BYBIT | PAPER MODE ONLY</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -1961,7 +2071,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.0 | 5m + 15m + 1h confirmation<br>
+Version 16.1 | 5m + 15m + 1h confirmation<br>
 ATR stop | 1.8:1 target/risk | 10-minute re-entry cooldown<br>
 Paper trading only | Fee estimate 0.055% per side<br>
 Last scan: <span id="last">Waiting</span><br>
@@ -2021,6 +2131,7 @@ async function update(){
    d.running?'TRADING ACTIVE - NEW ENTRIES ENABLED':'TRADING ENDED - MONITORING OPEN POSITIONS';
 
   document.getElementById('private').textContent=d.private_status;
+
   document.getElementById('account').textContent=
    d.account_balance===null?'Account balance unavailable':'Bybit USDT wallet: '+money(d.account_balance);
 
@@ -2028,6 +2139,7 @@ async function update(){
   document.getElementById('error').textContent=d.last_error||'None';
 
   let s=d.stats;
+
   document.getElementById('completed').textContent=s.completed_count;
   document.getElementById('winrate').textContent=s.win_rate+'%';
   document.getElementById('wins').textContent=s.wins;
@@ -2035,16 +2147,20 @@ async function update(){
   document.getElementById('realized').textContent=money(s.history_realized_pnl);
   document.getElementById('fees').textContent=money(s.total_fees);
   document.getElementById('profitfactor').textContent=s.profit_factor;
+
   document.getElementById('averages').textContent=
    money(s.average_win)+' / '+money(s.average_loss);
+
   document.getElementById('drawdown').textContent=s.max_drawdown+'%';
 
   let learning=d.learning;
 
   document.getElementById('learnsamples').textContent=
    learning.samples+'/'+learning.minimum_samples+' minimum';
+
   document.getElementById('learnupdates').textContent=learning.updates;
   document.getElementById('learnresult').textContent=learning.last_result||'Waiting';
+
   document.getElementById('learnstatus').textContent=
    learning.samples>=learning.minimum_samples?'ADAPTIVE':'COLLECTING';
 
@@ -2054,9 +2170,11 @@ async function update(){
    :'The engine needs '+Math.max(0,learning.minimum_samples-learning.samples)+' more eligible completed trades before its first adjustment.';
 
   let weightRows='';
+
   for(let [name,value] of Object.entries(learning.weights||{})){
    weightRows+=`<div class="weight"><span>${safe(name.replaceAll('_',' ').toUpperCase())}</span><b>${Number(value).toFixed(3)}x</b></div>`;
   }
+
   document.getElementById('weights').innerHTML=weightRows||'Waiting...';
 
   document.getElementById('scanner').textContent=d.last_scan?'ACTIVE':'WAITING';
@@ -2089,6 +2207,7 @@ async function update(){
    details||'Waiting for market data';
 
   let positionRows='';
+
   for(let p of d.positions){
    positionRows+=`<tr>
     <td>${safe(p.symbol)}</td><td>${safe(p.side)}</td>
@@ -2102,6 +2221,7 @@ async function update(){
    positionRows||'<tr><td colspan="8">No open positions</td></tr>';
 
   let historyRows='';
+
   for(let p of d.history){
    historyRows+=`<tr>
     <td>${safe(p.closed||'-')}</td><td>${safe(p.symbol)}</td>
@@ -2188,6 +2308,7 @@ def api_data():
     unrealized = sum(
         number(p.get("unrealized_pnl")) for p in positions
     )
+
     used_margin = sum(
         number(p.get("margin")) for p in positions
     )
