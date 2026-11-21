@@ -111,8 +111,8 @@ private_api = None
 
 if API_KEY and API_SECRET:
     private_api = HTTP(
-        api_key=vA9UkYkaoBHPySdPT9 
-        api_secret=8uZSZDZdn8ra8xX4ephBuI7yOkyLpGKyot7h
+        api_key="vA9UkYkaoBHPySdPT9"" 
+        api_secret"=8uZSZDZdn8ra8xX4ephBuI7yOkyLpGKyot7h""
         testnet=False,
         timeout=15
     )
