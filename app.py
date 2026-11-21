@@ -29,7 +29,14 @@ log = logging.getLogger("CoinSentraV16")
 
 # ---------------- SETTINGS ----------------
 
-SYMBOLS = ["ETHUSDT", "XRPUSDT", "SOLUSDT", "SUIUSDT"]
+SYMBOLS = [
+    "ETHUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "ADAUSDT",
+    "NEARUSDT"
+]
 CATEGORY = "linear"
 
 LEVERAGE = 8
