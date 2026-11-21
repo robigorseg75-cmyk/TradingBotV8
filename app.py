@@ -8,26 +8,33 @@ import uuid
 import hashlib
 import urllib.request
 import urllib.error
-import urllib.parse
 from datetime import datetime, timezone, date
 
 from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.3 - SUPABASE EDITION
-# BYBIT | RENDER | PAPER TRADING ONLY
-# SUPABASE PERSISTENCE | HISTORY + LEARNING RECOVERY
-# 1.4% STOP LOSS | 1.7% TAKE PROFIT
+# COINSENTRA TRADING BRAIN V16.4
+# BYBIT | RENDER | SUPABASE | PAPER TRADING ONLY
+# CLOUD STATE RECOVERY | LEARNING RECOVERY
+# FIXED TP 1.7% | FIXED SL 1.4%
 # ============================================================
 
 app = Flask(__name__)
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("BotSentraV16")
 
 # ---------------- SETTINGS ----------------
 
-SYMBOLS = ["ETHUSDT", "XRPUSDT", "SOLUSDT", "SUIUSDT", "ADAUSDT", "NEARUSDT"]
+SYMBOLS = [
+    "ETHUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "ADAUSDT",
+    "NEARUSDT"
+]
 CATEGORY = "linear"
 
 LEVERAGE = 8
@@ -44,22 +51,22 @@ STRONG_ENTRY_SCORE = 70
 CONFIRMATION_INTERVAL = "15"
 HIGHER_INTERVAL = "60"
 
-# Fixed percentage exits, measured from entry price.
-STOP_LOSS_PERCENT = 0.014       # 1.4%
-TAKE_PROFIT_PERCENT = 0.017     # 1.7%
-
-# ATR remains part of market analysis, but no longer sets the exit distance.
 ATR_PERIOD = 14
 ATR_STOP_MULTIPLIER = 1.5
 MIN_STOP_PERCENT = 0.004
 MAX_STOP_PERCENT = 0.015
-REWARD_RISK = TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT
+REWARD_RISK = 1.8
+
+# FIXED EXIT SETTINGS
+TAKE_PROFIT_PERCENT = 0.017
+STOP_LOSS_PERCENT = 0.014
 
 COOLDOWN_SECONDS = 30
+
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "16.3-SUPABASE"
+VERSION = "16.4"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -76,16 +83,23 @@ LEARNING_FEATURES = [
     "orderbook", "confirmation", "higher_timeframe",
     "adx", "funding", "open_interest"
 ]
+
 DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 
-# ---------------- SUPABASE STORAGE ----------------
+# ---------------- STORAGE ----------------
 
+DATA_DIR = os.getenv("DATA_DIR", "/tmp")
+STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v16.json")
+
+# SUPABASE CLOUD PERSISTENCE
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-SUPABASE_STATE_ID = os.getenv("SUPABASE_STATE_ID", "coinsentra_v16").strip()
+SUPABASE_STATE_ID = os.getenv(
+    "SUPABASE_STATE_ID", "coinsentra_v16"
+).strip()
+
 SUPABASE_TABLE = "coinsentra_state"
-DATA_DIR = os.getenv("DATA_DIR", "/tmp")
-BACKUP_FILE = os.path.join(DATA_DIR, "coinsentra_v16_backup.json")
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
@@ -94,8 +108,14 @@ API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 
 public_api = HTTP(testnet=False, timeout=15)
 private_api = None
+
 if API_KEY and API_SECRET:
-    private_api = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=False, timeout=15)
+    private_api = HTTP(
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        testnet=False,
+        timeout=15
+    )
 
 # ---------------- STATE ----------------
 
@@ -119,7 +139,7 @@ state = {
     "scan_count": 0,
     "last_closed_by_symbol": {},
     "version": VERSION,
-    "storage_status": "NOT CONFIGURED",
+    "storage_status": "SUPABASE NOT CONFIGURED",
     "learning": {
         "enabled": LEARNING_ENABLED,
         "weights": dict(DEFAULT_WEIGHTS),
@@ -131,12 +151,14 @@ state = {
     }
 }
 
+
 # ============================================================
 # GENERAL HELPERS
 # ============================================================
 
 def now_text():
     return datetime.now(timezone.utc).isoformat()
+
 
 def number(value, default=0.0):
     try:
@@ -145,31 +167,128 @@ def number(value, default=0.0):
     except (TypeError, ValueError, OverflowError):
         return default
 
+
 def safe_int(value, default=0):
     try:
         return int(float(value))
     except (TypeError, ValueError, OverflowError):
         return default
 
+
 def check_bybit_result(result):
     if not isinstance(result, dict):
         raise ValueError("Invalid Bybit response")
+
     code = result.get("retCode", 0)
+
     if code not in (0, "0", None):
-        raise ValueError("Bybit error " + str(code) + ": " + str(result.get("retMsg", "Unknown error")))
+        raise ValueError(
+            "Bybit error " + str(code) + ": "
+            + str(result.get("retMsg", "Unknown error"))
+        )
+
     return result
 
+
 # ============================================================
-# TRADE CLEANING
+# SUPABASE CLOUD STORAGE
+# ============================================================
+
+def supabase_request(method, endpoint, payload=None):
+    if not SUPABASE_ENABLED:
+        raise RuntimeError("Supabase is not configured")
+
+    url = SUPABASE_URL + "/rest/v1/" + endpoint
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": "Bearer " + SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    if method in ("POST", "PATCH"):
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+
+    body = None
+
+    if payload is not None:
+        body = json.dumps(payload, allow_nan=False).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers=headers,
+        method=method
+    )
+
+    with urllib.request.urlopen(request, timeout=15) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+
+        if not raw:
+            return None
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+
+
+def supabase_load_state():
+    if not SUPABASE_ENABLED:
+        return None
+
+    endpoint = (
+        SUPABASE_TABLE
+        + "?id=eq."
+        + urllib.parse.quote(SUPABASE_STATE_ID, safe="")
+        + "&select=data&limit=1"
+    )
+
+    result = supabase_request("GET", endpoint)
+
+    if isinstance(result, list) and result:
+        row = result[0]
+
+        if isinstance(row, dict) and isinstance(row.get("data"), dict):
+            log.info("SUPABASE STATE FOUND")
+            return row["data"]
+
+    log.info("SUPABASE STATE ROW NOT FOUND")
+    return None
+
+
+def supabase_save_state(snapshot):
+    if not SUPABASE_ENABLED:
+        return False
+
+    payload = {
+        "id": SUPABASE_STATE_ID,
+        "data": snapshot,
+        "updated_at": now_text()
+    }
+
+    endpoint = SUPABASE_TABLE + "?on_conflict=id"
+
+    supabase_request("POST", endpoint, payload)
+
+    log.info("SUPABASE CLOUD SAVE SUCCESS")
+    return True
+
+
+# ============================================================
+# TRADE CLEANING AND STORAGE
 # ============================================================
 
 def clean_trade(trade):
     if not isinstance(trade, dict):
         return None
+
     if trade.get("exit") is None or trade.get("pnl") is None:
         return None
 
     result = dict(trade)
+
     if not result.get("trade_id"):
         identity = {
             "symbol": result.get("symbol", ""),
@@ -180,8 +299,18 @@ def clean_trade(trade):
             "exit": result.get("exit", 0),
             "quantity": result.get("quantity", 0)
         }
-        fingerprint = json.dumps(identity, sort_keys=True, default=str)
-        result["trade_id"] = "OLD-" + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+
+        fingerprint = json.dumps(
+            identity,
+            sort_keys=True,
+            default=str
+        )
+
+        result["trade_id"] = (
+            "OLD-" + hashlib.sha256(
+                fingerprint.encode("utf-8")
+            ).hexdigest()[:16]
+        )
 
     result.setdefault("status", "COMPLETED")
     result.setdefault("fees", 0.0)
@@ -191,283 +320,341 @@ def clean_trade(trade):
     result.setdefault("opened", "")
     result.setdefault("closed", "")
     result.setdefault("feature_snapshot", {})
-    for field in ("entry", "exit", "quantity", "gross_pnl", "fees", "pnl", "net_pnl"):
-        result[field] = number(result.get(field))
+
+    result["entry"] = number(result.get("entry"))
+    result["exit"] = number(result.get("exit"))
+    result["quantity"] = number(result.get("quantity"))
+    result["gross_pnl"] = number(result.get("gross_pnl"))
+    result["fees"] = number(result.get("fees"))
+    result["pnl"] = number(result.get("pnl"))
+    result["net_pnl"] = number(result.get("net_pnl"))
     result["status"] = "COMPLETED"
 
     if not isinstance(result["feature_snapshot"], dict):
         result["feature_snapshot"] = {}
-    if result["entry"] <= 0 or result["exit"] <= 0 or result["quantity"] <= 0:
+
+    if (
+        result["entry"] <= 0
+        or result["exit"] <= 0
+        or result["quantity"] <= 0
+    ):
         return None
+
     return result
 
-# ============================================================
-# SUPABASE REST STORAGE
-# ============================================================
-
-def supabase_configured():
-    return bool(SUPABASE_URL and SUPABASE_KEY and SUPABASE_STATE_ID)
-
-def supabase_request(method, query="", payload=None):
-    if not supabase_configured():
-        raise RuntimeError("Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY.")
-    url = SUPABASE_URL + "/rest/v1/" + SUPABASE_TABLE
-    if query:
-        url += "?" + query
-
-    body = None
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": "Bearer " + SUPABASE_KEY,
-        "Accept": "application/json"
-    }
-    if payload is not None:
-        body = json.dumps(payload, allow_nan=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    if method == "POST":
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else None
-    except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError("Supabase HTTP " + str(exc.code) + ": " + details)
-    except Exception as exc:
-        raise RuntimeError("Supabase request failed: " + str(exc))
-
-def save_local_backup(snapshot):
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        temp = BACKUP_FILE + "." + uuid.uuid4().hex + ".tmp"
-        try:
-            with open(temp, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, indent=2, allow_nan=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp, BACKUP_FILE)
-        finally:
-            if os.path.exists(temp):
-                os.remove(temp)
-        return True
-    except Exception:
-        log.exception("Local backup save failed")
-        return False
 
 def save_state():
-    """Save to Supabase first; local JSON is only a temporary backup."""
+    """
+    Save to Supabase cloud and local fallback.
+    Lock order: storage_lock, then lock.
+    Never call this while already holding lock.
+    """
+
     try:
         with storage_lock:
             with lock:
-                snapshot = json.loads(json.dumps(state, allow_nan=False))
-            if not supabase_configured():
-                with lock:
-                    state["storage_status"] = "ERROR - SUPABASE ENVIRONMENT VARIABLES MISSING"
-                log.error("Supabase save skipped: missing environment variables")
-                save_local_backup(snapshot)
-                return False
+                snapshot = json.loads(
+                    json.dumps(state, allow_nan=False)
+                )
 
-            payload = {
-                "id": SUPABASE_STATE_ID,
-                "data": snapshot,
-                "updated_at": now_text()
-            }
-            supabase_request("POST", "on_conflict=id", payload)
+            cloud_saved = False
+
+            if SUPABASE_ENABLED:
+                try:
+                    cloud_saved = supabase_save_state(snapshot)
+
+                except Exception as cloud_error:
+                    log.exception("SUPABASE CLOUD SAVE FAILED")
+
+                    with lock:
+                        state["storage_status"] = (
+                            "CLOUD SAVE FAILED: "
+                            + str(cloud_error)[:160]
+                        )
+
+            # Local backup/fallback save
+            local_saved = False
+
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+
+                temp_file = (
+                    STATE_FILE + "." + uuid.uuid4().hex + ".tmp"
+                )
+
+                try:
+                    with open(temp_file, "w", encoding="utf-8") as f:
+                        json.dump(
+                            snapshot,
+                            f,
+                            indent=2,
+                            allow_nan=False
+                        )
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                    os.replace(temp_file, STATE_FILE)
+                    local_saved = True
+
+                finally:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+
+            except Exception:
+                log.exception("LOCAL STATE SAVE FAILED")
+
             with lock:
-                state["storage_status"] = "CONNECTED - SUPABASE SAVED"
-            save_local_backup(snapshot)
-        log.info(
-            "SUPABASE STATE SAVED | positions=%s | history=%s",
-            len(snapshot.get("positions", [])),
-            len(snapshot.get("history", []))
-        )
-        return True
-    except Exception as exc:
-        with lock:
-            state["storage_status"] = "ERROR - " + str(exc)[:180]
-        log.exception("Supabase state save failed")
-        try:
-            with lock:
-                backup_snapshot = json.loads(json.dumps(state, allow_nan=False))
-            save_local_backup(backup_snapshot)
-        except Exception:
-            log.exception("Backup snapshot failed")
+                if cloud_saved:
+                    state["storage_status"] = "SUPABASE CLOUD SAVED"
+                elif local_saved:
+                    state["storage_status"] = "LOCAL BACKUP ONLY"
+                elif not SUPABASE_ENABLED:
+                    state["storage_status"] = "SUPABASE NOT CONFIGURED"
+                else:
+                    state["storage_status"] = "CLOUD AND LOCAL SAVE FAILED"
+
+            log.info(
+                "STATE SAVE | cloud=%s | local=%s | positions=%s | history=%s",
+                cloud_saved,
+                local_saved,
+                len(snapshot.get("positions", [])),
+                len(snapshot.get("history", []))
+            )
+
+            return cloud_saved or local_saved
+
+    except Exception:
+        log.exception("V16.4 state save failed")
         return False
 
-def read_local_backup():
-    if not os.path.exists(BACKUP_FILE):
-        return None
-    try:
-        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        return saved if isinstance(saved, dict) else None
-    except Exception:
-        log.exception("Local backup read failed")
-        return None
-        
-        def normalize_loaded_state(saved):
-    if not isinstance(saved, dict):
-        raise ValueError("Saved state is not a dictionary")
-
-    with lock:
-        for key in (
-            "balance", "positions", "history", "daily_pnl", "daily_date",
-            "running", "last_scan", "last_error", "private_status",
-            "account_balance", "symbols", "scan_count", "last_closed_by_symbol"
-        ):
-            if key in saved:
-                state[key] = saved[key]
-
-        if not isinstance(state["positions"], list):
-            state["positions"] = []
-        if not isinstance(state["history"], list):
-            state["history"] = []
-        if not isinstance(state["symbols"], dict):
-            state["symbols"] = {}
-        if not isinstance(state["last_closed_by_symbol"], dict):
-            state["last_closed_by_symbol"] = {}
-        state["balance"] = number(state.get("balance"), START_BALANCE)
-
-        saved_learning = saved.get("learning", {})
-        if not isinstance(saved_learning, dict):
-            saved_learning = {}
-        saved_weights = saved_learning.get("weights", {})
-        if not isinstance(saved_weights, dict):
-            saved_weights = {}
-        weights = dict(DEFAULT_WEIGHTS)
-        for name in LEARNING_FEATURES:
-            weights[name] = round(max(
-                LEARNING_MIN_WEIGHT,
-                min(LEARNING_MAX_WEIGHT, number(saved_weights.get(name), 1.0))
-            ), 4)
-
-        processed_ids = saved_learning.get("processed_trade_ids", [])
-        if not isinstance(processed_ids, list):
-            processed_ids = []
-        state["learning"] = {
-            "enabled": LEARNING_ENABLED,
-            "weights": weights,
-            "samples": max(0, safe_int(saved_learning.get("samples"))),
-            "updates": max(0, safe_int(saved_learning.get("updates"))),
-            "last_update": saved_learning.get("last_update"),
-            "last_result": saved_learning.get("last_result", "Waiting for completed trades"),
-            "processed_trade_ids": [str(x) for x in processed_ids][-2000:]
-        }
-
-        cleaned_history = []
-        seen_ids = set()
-        for item in state["history"]:
-            trade = clean_trade(item)
-            if trade is None:
-                continue
-            if trade["trade_id"] in seen_ids:
-                continue
-            seen_ids.add(trade["trade_id"])
-            cleaned_history.append(trade)
-        state["history"] = cleaned_history[:MAX_HISTORY]
-
-        restored_positions = []
-        for position in state["positions"]:
-            if not isinstance(position, dict):
-                log.error("Invalid non-dictionary position")
-                continue
-            position.setdefault("trade_id", uuid.uuid4().hex)
-            position.setdefault("opened", now_text())
-            position.setdefault("current_price", number(position.get("entry")))
-            position.setdefault("unrealized_pnl", 0.0)
-            position.setdefault("feature_snapshot", {})
-            if not isinstance(position["feature_snapshot"], dict):
-                position["feature_snapshot"] = {}
-
-            entry = number(position.get("entry"))
-            side = position.get("side")
-            if entry > 0 and side in ("LONG", "SHORT"):
-                # Apply fixed exits to recovered open positions too.
-                sl_distance = entry * STOP_LOSS_PERCENT
-                tp_distance = entry * TAKE_PROFIT_PERCENT
-                position["stop_loss"] = entry - sl_distance if side == "LONG" else entry + sl_distance
-                position["take_profit"] = entry + tp_distance if side == "LONG" else entry - tp_distance
-                position["stop_distance"] = sl_distance
-                position["risk_amount"] = number(position.get("quantity")) * sl_distance
-
-            if (
-                entry <= 0 or number(position.get("quantity")) <= 0
-                or number(position.get("stop_loss")) <= 0
-                or number(position.get("take_profit")) <= 0
-            ):
-                position["state_error"] = "Invalid saved position values - preserved"
-                log.error("POSITION RECOVERY WARNING | %s", position.get("trade_id"))
-            else:
-                position.pop("state_error", None)
-            restored_positions.append(position)
-
-        state["positions"] = restored_positions
-        state["version"] = VERSION
 
 def load_state():
     saved = None
-    loaded_from = "none"
+    loaded_from = "NONE"
 
-    if supabase_configured():
+    # Cloud is the primary source.
+    if SUPABASE_ENABLED:
         try:
-            query = urllib.parse.urlencode({
-                "id": "eq." + SUPABASE_STATE_ID,
-                "select": "data"
-            })
-            rows = supabase_request("GET", query)
-            if isinstance(rows, list) and rows and isinstance(rows[0].get("data"), dict):
-                saved = rows[0]["data"]
-                loaded_from = "supabase"
-                log.info("State restored from Supabase")
-            else:
-                log.info("No existing Supabase state row; starting new paper account")
-                with lock:
-                    state["storage_status"] = "CONNECTED - NEW STATE"
-        except Exception as exc:
-            log.exception("Supabase load failed")
-            with lock:
-                state["storage_status"] = "ERROR - " + str(exc)[:180]
-    else:
-        with lock:
-            state["storage_status"] = "NOT CONFIGURED - CHECK RENDER ENVIRONMENT"
+            saved = supabase_load_state()
 
-    if saved is None:
-        saved = read_local_backup()
-        if saved is not None:
-            loaded_from = "local backup"
-            log.warning("Restored local backup; Supabase must be checked")
+            if saved is not None:
+                loaded_from = "SUPABASE"
 
+        except Exception:
+            log.exception("SUPABASE LOAD FAILED")
+
+    # Use local backup only if cloud has no usable state.
     if saved is None:
-        log.info("No saved state found; new V16.3 paper account")
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+
+                loaded_from = "LOCAL BACKUP"
+
+            except Exception:
+                log.exception("LOCAL STATE LOAD FAILED")
+
+        else:
+            log.info("No existing paper account state found")
+            return
+
+    if not isinstance(saved, dict):
+        log.error("Saved state is not a dictionary")
         return
 
     try:
-        normalize_loaded_state(saved)
-        if loaded_from == "supabase":
-            with lock:
-                state["storage_status"] = "CONNECTED - RESTORED FROM SUPABASE"
-        else:
-            with lock:
-                state["storage_status"] = "LOCAL BACKUP RESTORED - SUPABASE NOT VERIFIED"
+        with lock:
+            for key in (
+                "balance", "positions", "history", "daily_pnl",
+                "daily_date", "running", "last_scan", "last_error",
+                "private_status", "account_balance", "symbols",
+                "scan_count", "last_closed_by_symbol"
+            ):
+                if key in saved:
+                    state[key] = saved[key]
+
+            if not isinstance(state["positions"], list):
+                state["positions"] = []
+
+            if not isinstance(state["history"], list):
+                state["history"] = []
+
+            if not isinstance(state["symbols"], dict):
+                state["symbols"] = {}
+
+            if not isinstance(state["last_closed_by_symbol"], dict):
+                state["last_closed_by_symbol"] = {}
+
+            state["balance"] = number(
+                state.get("balance"), START_BALANCE
+            )
+
+            saved_learning = saved.get("learning", {})
+
+            if not isinstance(saved_learning, dict):
+                saved_learning = {}
+
+            saved_weights = saved_learning.get("weights", {})
+
+            if not isinstance(saved_weights, dict):
+                saved_weights = {}
+
+            weights = dict(DEFAULT_WEIGHTS)
+
+            for name in LEARNING_FEATURES:
+                weights[name] = round(
+                    max(
+                        LEARNING_MIN_WEIGHT,
+                        min(
+                            LEARNING_MAX_WEIGHT,
+                            number(saved_weights.get(name), 1.0)
+                        )
+                    ),
+                    4
+                )
+
+            processed_ids = saved_learning.get(
+                "processed_trade_ids", []
+            )
+
+            if not isinstance(processed_ids, list):
+                processed_ids = []
+
+            state["learning"] = {
+                "enabled": LEARNING_ENABLED,
+                "weights": weights,
+                "samples": max(
+                    0, safe_int(saved_learning.get("samples"))
+                ),
+                "updates": max(
+                    0, safe_int(saved_learning.get("updates"))
+                ),
+                "last_update": saved_learning.get("last_update"),
+                "last_result": saved_learning.get(
+                    "last_result",
+                    "Waiting for completed trades"
+                ),
+                "processed_trade_ids": [
+                    str(x) for x in processed_ids
+                ][-2000:]
+            }
+
+            cleaned_history = []
+            seen_ids = set()
+
+            for item in state["history"]:
+                trade = clean_trade(item)
+
+                if trade is None:
+                    continue
+
+                trade_id = trade["trade_id"]
+
+                if trade_id in seen_ids:
+                    continue
+
+                seen_ids.add(trade_id)
+                cleaned_history.append(trade)
+
+            state["history"] = cleaned_history[:MAX_HISTORY]
+
+            restored_positions = []
+
+            for position in state["positions"]:
+                if not isinstance(position, dict):
+                    log.error("Invalid non-dictionary position")
+                    continue
+
+                position.setdefault("trade_id", uuid.uuid4().hex)
+                position.setdefault("opened", now_text())
+                position.setdefault(
+                    "current_price",
+                    number(position.get("entry"))
+                )
+                position.setdefault("unrealized_pnl", 0.0)
+                position.setdefault("feature_snapshot", {})
+
+                if not isinstance(position["feature_snapshot"], dict):
+                    position["feature_snapshot"] = {}
+
+                entry = number(position.get("entry"))
+                side = position.get("side")
+
+                # Recover fixed percentage exits for old saved positions.
+                if entry > 0 and side in ("LONG", "SHORT"):
+                    if side == "LONG":
+                        position["stop_loss"] = entry * (
+                            1 - STOP_LOSS_PERCENT
+                        )
+                        position["take_profit"] = entry * (
+                            1 + TAKE_PROFIT_PERCENT
+                        )
+                    else:
+                        position["stop_loss"] = entry * (
+                            1 + STOP_LOSS_PERCENT
+                        )
+                        position["take_profit"] = entry * (
+                            1 - TAKE_PROFIT_PERCENT
+                        )
+
+                    position["stop_distance"] = (
+                        entry * STOP_LOSS_PERCENT
+                    )
+                    position["reward_risk"] = (
+                        TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT
+                    )
+
+                if (
+                    entry <= 0
+                    or number(position.get("quantity")) <= 0
+                    or number(position.get("stop_loss")) <= 0
+                    or number(position.get("take_profit")) <= 0
+                ):
+                    position["state_error"] = (
+                        "Invalid saved position values - preserved"
+                    )
+                    log.error(
+                        "POSITION RECOVERY WARNING | %s",
+                        position.get("trade_id")
+                    )
+                else:
+                    position.pop("state_error", None)
+
+                restored_positions.append(position)
+
+            state["positions"] = restored_positions
+            state["version"] = VERSION
+            state["storage_status"] = (
+                "RESTORED FROM " + loaded_from
+            )
+
         log.info(
-            "STATE RESTORED FROM %s | positions=%s | completed=%s",
-            loaded_from, len(state["positions"]), len(state["history"])
+            "V16.4 RESTORED FROM %s | positions=%s | completed=%s",
+            loaded_from,
+            len(state["positions"]),
+            len(state["history"])
         )
+
+        # If recovered from local backup, migrate immediately to cloud.
+        if SUPABASE_ENABLED and loaded_from == "LOCAL BACKUP":
+            log.info("MIGRATING LOCAL STATE TO SUPABASE")
+            save_state()
+
     except Exception:
-        log.exception("V16.3 state normalization failed")
+        log.exception("V16.4 state loading failed")
+
 
 def reset_daily():
     today = str(date.today())
-    changed = False
+
     with lock:
         if state["daily_date"] != today:
             state["daily_date"] = today
             state["daily_pnl"] = 0.0
-            changed = True
-    if changed:
-        save_state()
+
+    save_state()
+
 
 # ============================================================
 # ADAPTIVE LEARNING
@@ -476,239 +663,352 @@ def reset_daily():
 def learning_snapshot_for_side(features, side):
     if not isinstance(features, dict):
         return {}
+
     direction = 1 if side == "LONG" else -1
-    return {
-        name: max(-1.0, min(1.0, number(features.get(name)) * direction))
-        for name in LEARNING_FEATURES
-    }
+    result = {}
+
+    for name in LEARNING_FEATURES:
+        value = number(features.get(name))
+        result[name] = max(-1.0, min(1.0, value * direction))
+
+    return result
+
 
 def update_learning(trade):
     if not LEARNING_ENABLED or not isinstance(trade, dict):
         return
+
     trade = clean_trade(trade)
+
     if trade is None:
         return
+
     features = trade.get("feature_snapshot")
+
     if not isinstance(features, dict) or not features:
-        log.warning("LEARNING SKIPPED: missing features | %s", trade.get("trade_id"))
+        log.warning(
+            "LEARNING SKIPPED: missing features | %s",
+            trade.get("trade_id")
+        )
         return
+
     trade_id = str(trade.get("trade_id", ""))
     pnl = number(trade.get("pnl"))
+
     if not trade_id or pnl == 0:
         return
 
     with lock:
         learning = state["learning"]
+
         processed = learning.get("processed_trade_ids", [])
+
         if not isinstance(processed, list):
             processed = []
+
         if trade_id in processed:
             return
+
         processed.append(trade_id)
         learning["processed_trade_ids"] = processed[-2000:]
-        learning["samples"] = safe_int(learning.get("samples")) + 1
 
-        chronological = [clean_trade(item) for item in reversed(state["history"])]
-        chronological = [item for item in chronological if item is not None]
+        learning["samples"] = safe_int(
+            learning.get("samples")
+        ) + 1
+
+        chronological = [
+            clean_trade(item)
+            for item in reversed(state["history"])
+        ]
+
+        chronological = [
+            item for item in chronological
+            if item is not None
+        ]
+
         current_index = next(
-            (i for i, item in enumerate(chronological) if item.get("trade_id") == trade_id),
+            (
+                i for i, item in enumerate(chronological)
+                if item.get("trade_id") == trade_id
+            ),
             None
         )
+
         if current_index is None:
             chronological.append(trade)
             current_index = len(chronological) - 1
 
         eligible = []
+
         for item in chronological[:current_index + 1]:
             snapshot = item.get("feature_snapshot", {})
             item_pnl = number(item.get("pnl"))
-            if isinstance(snapshot, dict) and snapshot and item_pnl != 0:
+
+            if (
+                isinstance(snapshot, dict)
+                and snapshot
+                and item_pnl != 0
+            ):
                 eligible.append({
                     "features": snapshot,
                     "outcome": 1.0 if item_pnl > 0 else -1.0
                 })
+
         eligible = eligible[-LEARNING_WINDOW:]
 
         if len(eligible) < LEARNING_MIN_SAMPLES:
-            learning["last_result"] = "WIN - collecting samples" if pnl > 0 else "LOSS - collecting samples"
+            learning["last_result"] = (
+                "WIN - collecting samples"
+                if pnl > 0
+                else "LOSS - collecting samples"
+            )
+
         else:
             weights = dict(learning["weights"])
+
             for name in LEARNING_FEATURES:
-                values = [
-                    number(sample["features"].get(name)) * sample["outcome"]
-                    for sample in eligible
-                ]
-                correlation = sum(values) / len(values) if values else 0.0
-                new_weight = number(weights.get(name), 1.0) + correlation * LEARNING_RATE
-                weights[name] = round(max(LEARNING_MIN_WEIGHT, min(LEARNING_MAX_WEIGHT, new_weight)), 4)
+                values = []
+
+                for sample in eligible:
+                    feature_value = number(
+                        sample["features"].get(name)
+                    )
+
+                    values.append(
+                        feature_value * sample["outcome"]
+                    )
+
+                correlation = (
+                    sum(values) / len(values)
+                    if values else 0.0
+                )
+
+                new_weight = (
+                    number(weights.get(name), 1.0)
+                    + correlation * LEARNING_RATE
+                )
+
+                weights[name] = round(
+                    max(
+                        LEARNING_MIN_WEIGHT,
+                        min(LEARNING_MAX_WEIGHT, new_weight)
+                    ),
+                    4
+                )
+
             learning["weights"] = weights
-            learning["updates"] = safe_int(learning.get("updates")) + 1
-            learning["last_result"] = "WIN - weights updated" if pnl > 0 else "LOSS - weights updated"
+
+            learning["updates"] = safe_int(
+                learning.get("updates")
+            ) + 1
+
+            learning["last_result"] = (
+                "WIN - weights updated"
+                if pnl > 0
+                else "LOSS - weights updated"
+            )
+
         learning["last_update"] = now_text()
 
     if not save_state():
-        log.error("LEARNING SAVE FAILED | trade=%s", trade_id)
+        log.error(
+            "LEARNING SAVE FAILED | trade=%s",
+        trade_id
+    )
+
 
 def recover_learning():
     if not LEARNING_ENABLED:
         return
+
     with lock:
-        completed = [clean_trade(item) for item in reversed(state["history"])]
-    completed = [item for item in completed if item is not None]
+        completed = [
+            clean_trade(item)
+            for item in reversed(state["history"])
+        ]
+
+    completed = [
+        item for item in completed
+        if item is not None
+    ]
+
     recovered = 0
+
     for trade in completed:
         with lock:
-            processed = state["learning"].get("processed_trade_ids", [])
+            processed = state["learning"].get(
+                "processed_trade_ids", []
+            )
+
             if trade["trade_id"] in processed:
                 continue
+
         try:
             update_learning(trade)
+
             with lock:
-                processed_now = state["learning"].get("processed_trade_ids", [])
+                processed_now = state["learning"].get(
+                    "processed_trade_ids", []
+                )
+
             if trade["trade_id"] in processed_now:
                 recovered += 1
+
         except Exception:
-            log.exception("LEARNING RECOVERY FAILED | %s", trade.get("trade_id"))
+            log.exception(
+                "LEARNING RECOVERY FAILED | %s",
+                trade.get("trade_id")
+            )
+
     if recovered:
-        log.info("LEARNING RECOVERY COMPLETE | processed=%s", recovered)
+        log.info(
+            "LEARNING RECOVERY COMPLETE | processed=%s",
+            recovered
+        )
+
 
 def get_learning_weights():
     with lock:
         return dict(state["learning"]["weights"])
+
 
 # ============================================================
 # MARKET DATA
 # ============================================================
 
 def get_price(symbol):
-    result = check_bybit_result(public_api.get_tickers(category=CATEGORY, symbol=symbol))
+    result = check_bybit_result(
+        public_api.get_tickers(
+            category=CATEGORY,
+            symbol=symbol
+        )
+    )
+
     rows = result.get("result", {}).get("list", [])
+
     if not rows:
         raise ValueError("No ticker data: " + symbol)
-    price_value = number(rows[0].get("lastPrice"))
-    if price_value <= 0:
+
+    price = number(rows[0].get("lastPrice"))
+
+    if price <= 0:
         raise ValueError("Invalid ticker price: " + symbol)
-    return price_value
+
+    return price
+
 
 def get_candles(symbol, interval, limit=200):
-    result = check_bybit_result(public_api.get_kline(
-        category=CATEGORY, symbol=symbol, interval=interval, limit=limit
-    ))
+    result = check_bybit_result(
+        public_api.get_kline(
+            category=CATEGORY,
+            symbol=symbol,
+            interval=interval,
+            limit=limit
+        )
+    )
+
     rows = result.get("result", {}).get("list", [])
+
     if not rows:
         raise ValueError("No candle data: " + symbol)
+
     candles = []
+
     for row in reversed(rows):
-        if not isinstance(row, list) or len(row) < 6:
+        if len(row) < 7:
             continue
+
         candles.append({
             "time": safe_int(row[0]),
             "open": number(row[1]),
             "high": number(row[2]),
             "low": number(row[3]),
             "close": number(row[4]),
-            "volume": number(row[5])
-        })
-    if len(candles) < 30:
-        raise ValueError("Insufficient candle data: " + symbol)
-    return candles
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-    multiplier = 2 / (period + 1)
-    result = sum(values[:period]) / period
-    for value in values[period:]:
-        result = (value - result) * multiplier + result
-    return result
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return 50.0
-    gains = []
-    losses = []
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def macd(values):
-    fast = ema(values, 12)
-    slow = ema(values, 26)
-    if fast is None or slow is None:
-        return 0.0, 0.0
-    line = fast - slow
-    series = []
-    for index in range(26, len(values) + 1):
-        f = ema(values[:index], 12)
-        s = ema(values[:index], 26)
-        if f is not None and s is not None:
-            series.append(f - s)
-    signal = ema(series, 9) if len(series) >= 9 else 0.0
-    return line, signal
-    def get_candles(symbol, interval, limit=200):
-    result = check_bybit_result(public_api.get_kline(
-        category=CATEGORY, symbol=symbol, interval=interval, limit=limit
-    ))
-    rows = result.get("result", {}).get("list", [])
-    if not rows:
-        raise ValueError("No candle data: " + symbol)
-    candles = []
-    for row in reversed(rows):
-        if len(row) < 7:
-            continue
-        candles.append({
-            "time": safe_int(row[0]), "open": number(row[1]),
-            "high": number(row[2]), "low": number(row[3]),
-            "close": number(row[4]), "volume": number(row[5]),
+            "volume": number(row[5]),
             "turnover": number(row[6])
         })
+
     if len(candles) < 60:
         raise ValueError("Insufficient candle history: " + symbol)
+
     candles = candles[:-1]
+
     if len(candles) < 55:
         raise ValueError("Not enough completed candles: " + symbol)
+
     return candles
 
+
 def get_orderbook(symbol):
-    result = check_bybit_result(public_api.get_orderbook(category=CATEGORY, symbol=symbol, limit=25))
+    result = check_bybit_result(
+        public_api.get_orderbook(
+            category=CATEGORY,
+            symbol=symbol,
+            limit=25
+        )
+    )
+
     data = result.get("result", {})
-    bids, asks = data.get("b", []), data.get("a", [])
+    bids = data.get("b", [])
+    asks = data.get("a", [])
+
     bid_volume = sum(number(x[1]) for x in bids if len(x) > 1)
     ask_volume = sum(number(x[1]) for x in asks if len(x) > 1)
+
     total = bid_volume + ask_volume
-    return (bid_volume - ask_volume) / total if total > 0 else 0.0
+
+    if total <= 0:
+        return 0.0
+
+    return (bid_volume - ask_volume) / total
+
 
 def get_funding(symbol):
     try:
-        result = check_bybit_result(public_api.get_funding_rate_history(category=CATEGORY, symbol=symbol, limit=1))
+        result = check_bybit_result(
+            public_api.get_funding_rate_history(
+                category=CATEGORY,
+                symbol=symbol,
+                limit=1
+            )
+        )
+
         rows = result.get("result", {}).get("list", [])
+
         if rows:
             return number(rows[0].get("fundingRate"))
+
     except Exception as e:
         log.warning("Funding error %s: %s", symbol, e)
+
     return 0.0
+
 
 def get_open_interest(symbol):
     try:
-        result = check_bybit_result(public_api.get_open_interest(
-            category=CATEGORY, symbol=symbol, intervalTime="5min", limit=2
-        ))
+        result = check_bybit_result(
+            public_api.get_open_interest(
+                category=CATEGORY,
+                symbol=symbol,
+                intervalTime="5min",
+                limit=2
+            )
+        )
+
         rows = result.get("result", {}).get("list", [])
+
         if len(rows) >= 2:
             older = number(rows[1].get("openInterest"))
             newer = number(rows[0].get("openInterest"))
+
             if older > 0:
                 return (newer - older) / older * 100
+
     except Exception as e:
         log.warning("OI error %s: %s", symbol, e)
+
     return 0.0
+
 
 # ============================================================
 # INDICATORS
@@ -717,109 +1017,215 @@ def get_open_interest(symbol):
 def ema(values, period):
     if len(values) < period:
         return None
+
     multiplier = 2 / (period + 1)
     result = sum(values[:period]) / period
+
     for value in values[period:]:
         result = value * multiplier + result * (1 - multiplier)
+
     return result
+
 
 def rsi(values, period=14):
     if len(values) < period + 1:
         return 50.0
-    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+
     gains = [max(x, 0) for x in changes]
     losses = [max(-x, 0) for x in changes]
+
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
+
     for i in range(period, len(changes)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
     if avg_loss == 0:
         return 100.0
+
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+
 def macd(values):
-    fast, slow = ema(values, 12), ema(values, 26)
-    return fast - slow if fast is not None and slow is not None else 0.0
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+
+    if fast is None or slow is None:
+        return 0.0
+
+    return fast - slow
+
 
 def bollinger(values, period=20):
     sample = values[-period:]
+
     if len(sample) < period:
         return 0.0, 0.0, 0.0
+
     middle = sum(sample) / period
-    variance = sum((x - middle) ** 2 for x in sample) / period
+
+    variance = sum(
+        (x - middle) ** 2 for x in sample
+    ) / period
+
     deviation = math.sqrt(max(0.0, variance))
-    return middle + 2 * deviation, middle, middle - 2 * deviation
+
+    return (
+        middle + 2 * deviation,
+        middle,
+        middle - 2 * deviation
+    )
+
 
 def atr(candles, period=ATR_PERIOD):
     if len(candles) < period + 1:
         return 0.0
-    true_ranges = []
-    for i in range(1, len(candles)):
-        current, previous = candles[i], candles[i - 1]
-        true_ranges.append(max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"])
-        ))
-    sample = true_ranges[-period:]
-    return sum(sample) / len(sample) if sample else 0.0
 
-def adx_approx(candles, period=14):
-    if len(candles) < period + 2:
-        return 0.0
-    tr_values, plus_values, minus_values = [], [], []
+    true_ranges = []
+
     for i in range(1, len(candles)):
-        current, previous = candles[i], candles[i - 1]
+        current = candles[i]
+        previous = candles[i - 1]
+
         tr = max(
             current["high"] - current["low"],
             abs(current["high"] - previous["close"]),
             abs(current["low"] - previous["close"])
         )
+
+        true_ranges.append(tr)
+
+    sample = true_ranges[-period:]
+
+    if not sample:
+        return 0.0
+
+    return sum(sample) / len(sample)
+
+
+def adx_approx(candles, period=14):
+    if len(candles) < period + 2:
+        return 0.0
+
+    tr_values = []
+    plus_values = []
+    minus_values = []
+
+    for i in range(1, len(candles)):
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
+        )
+
         up = current["high"] - previous["high"]
         down = previous["low"] - current["low"]
+
         tr_values.append(tr)
-        plus_values.append(up if up > down and up > 0 else 0)
-        minus_values.append(down if down > up and down > 0 else 0)
+        plus_values.append(
+            up if up > down and up > 0 else 0
+        )
+        minus_values.append(
+            down if down > up and down > 0 else 0
+        )
+
     tr_avg = sum(tr_values[-period:]) / period
+
     if tr_avg <= 0:
         return 0.0
-    plus_di = (sum(plus_values[-period:]) / period) / tr_avg * 100
-    minus_di = (sum(minus_values[-period:]) / period) / tr_avg * 100
+
+    plus_di = (
+        sum(plus_values[-period:]) / period
+        / tr_avg * 100
+    )
+
+    minus_di = (
+        sum(minus_values[-period:]) / period
+        / tr_avg * 100
+    )
+
     total = plus_di + minus_di
-    return abs(plus_di - minus_di) / total * 100 if total > 0 else 0.0
+
+    if total <= 0:
+        return 0.0
+
+    return abs(plus_di - minus_di) / total * 100
+
 
 def analyze_candles(candles):
     closes = [x["close"] for x in candles]
     volumes = [x["volume"] for x in candles]
+
     if len(closes) < 60:
         raise ValueError("Insufficient candles for indicators")
-    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
+
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    e50 = ema(closes, 50)
+
     upper, middle, lower = bollinger(closes)
+
     previous_volumes = volumes[-21:-1]
-    average_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0.0
-    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 0.0
+
+    average_volume = (
+        sum(previous_volumes) / len(previous_volumes)
+        if previous_volumes else 0.0
+    )
+
+    volume_ratio = (
+        volumes[-1] / average_volume
+        if average_volume > 0 else 0.0
+    )
+
     return {
-        "price": closes[-1], "ema9": e9, "ema21": e21, "ema50": e50,
-        "rsi": rsi(closes), "macd": macd(closes),
-        "bb_upper": upper, "bb_middle": middle, "bb_lower": lower,
-        "volume_ratio": volume_ratio, "adx": adx_approx(candles),
+        "price": closes[-1],
+        "ema9": e9,
+        "ema21": e21,
+        "ema50": e50,
+        "rsi": rsi(closes),
+        "macd": macd(closes),
+        "bb_upper": upper,
+        "bb_middle": middle,
+        "bb_lower": lower,
+        "volume_ratio": volume_ratio,
+        "adx": adx_approx(candles),
         "atr": atr(candles)
     }
 
+
 # ============================================================
-# V16.3 SIGNAL ENGINE
+# V16.4 SIGNAL ENGINE
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     weights = get_learning_weights()
-    long_score = short_score = 0.0
-    features = {name: 0.0 for name in LEARNING_FEATURES}
+
+    long_score = 0.0
+    short_score = 0.0
+
+    features = {
+        name: 0.0 for name in LEARNING_FEATURES
+    }
 
     if five["ema9"] > five["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
+
     elif five["ema9"] < five["ema21"]:
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
@@ -827,6 +1233,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if five["ema21"] > five["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
+
     elif five["ema21"] < five["ema50"]:
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
@@ -834,6 +1241,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if 50 <= five["rsi"] <= 68:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
+
     elif 32 <= five["rsi"] <= 50:
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
@@ -841,6 +1249,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if five["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
+
     elif five["macd"] < 0:
         features["macd"] = -1
         short_score += 8 * weights["macd"]
@@ -849,6 +1258,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         if five["ema9"] > five["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
+
         elif five["ema9"] < five["ema21"]:
             features["volume"] = -1
             short_score += 8 * weights["volume"]
@@ -856,6 +1266,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if imbalance > 0.15:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
+
     elif imbalance < -0.15:
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
@@ -863,14 +1274,22 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if fifteen["ema9"] > fifteen["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
+
     elif fifteen["ema9"] < fifteen["ema21"]:
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    if hourly["ema9"] > hourly["ema21"] and hourly["ema21"] > hourly["ema50"]:
+    if (
+        hourly["ema9"] > hourly["ema21"]
+        and hourly["ema21"] > hourly["ema50"]
+    ):
         features["higher_timeframe"] = 1
         long_score += 20 * weights["higher_timeframe"]
-    elif hourly["ema9"] < hourly["ema21"] and hourly["ema21"] < hourly["ema50"]:
+
+    elif (
+        hourly["ema9"] < hourly["ema21"]
+        and hourly["ema21"] < hourly["ema50"]
+    ):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
@@ -878,6 +1297,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         if five["ema9"] > five["ema21"]:
             features["adx"] = 1
             long_score += 6 * weights["adx"]
+
         elif five["ema9"] < five["ema21"]:
             features["adx"] = -1
             short_score += 6 * weights["adx"]
@@ -885,6 +1305,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if funding > 0.0005:
         features["funding"] = -1
         short_score += 2 * weights["funding"]
+
     elif funding < -0.0005:
         features["funding"] = 1
         long_score += 2 * weights["funding"]
@@ -893,43 +1314,71 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         if five["ema9"] > five["ema21"]:
             features["open_interest"] = 1
             long_score += 2 * weights["open_interest"]
+
         elif five["ema9"] < five["ema21"]:
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
 
     long_score = min(100, round(long_score))
     short_score = min(100, round(short_score))
-    signal, entry_reason = "WAIT", "Waiting for a valid setup"
+
+    signal = "WAIT"
+    entry_reason = "Waiting for a valid setup"
 
     long_confirmed = (
-        five["ema9"] > five["ema21"] and five["ema21"] > five["ema50"]
+        five["ema9"] > five["ema21"]
+        and five["ema21"] > five["ema50"]
         and fifteen["ema9"] > fifteen["ema21"]
-        and 50 <= five["rsi"] <= 68 and five["adx"] >= 18
-        and five["volume_ratio"] >= 1.15 and five["price"] > five["ema21"]
+        and five["rsi"] >= 50
+        and five["rsi"] <= 68
+        and five["adx"] >= 18
+        and five["volume_ratio"] >= 1.15
+        and five["price"] > five["ema21"]
     )
+
     short_confirmed = (
-        five["ema9"] < five["ema21"] and five["ema21"] < five["ema50"]
+        five["ema9"] < five["ema21"]
+        and five["ema21"] < five["ema50"]
         and fifteen["ema9"] < fifteen["ema21"]
-        and 32 <= five["rsi"] <= 50 and five["adx"] >= 18
-        and five["volume_ratio"] >= 1.15 and five["price"] < five["ema21"]
+        and five["rsi"] >= 32
+        and five["rsi"] <= 50
+        and five["adx"] >= 18
+        and five["volume_ratio"] >= 1.15
+        and five["price"] < five["ema21"]
     )
 
     if long_score >= ENTRY_SCORE and long_confirmed:
-        signal, entry_reason = "LONG", "LONG READY - 5m and 15m confirmed"
+        signal = "LONG"
+        entry_reason = "LONG READY - 5m and 15m confirmed"
+
     elif short_score >= ENTRY_SCORE and short_confirmed:
-        signal, entry_reason = "SHORT", "SHORT READY - 5m and 15m confirmed"
+        signal = "SHORT"
+        entry_reason = "SHORT READY - 5m and 15m confirmed"
+
     else:
         best_score = max(long_score, short_score)
+
         if best_score < ENTRY_SCORE:
-            entry_reason = "Score below entry threshold: " + str(ENTRY_SCORE)
+            entry_reason = (
+                "Score below entry threshold: "
+                + str(ENTRY_SCORE)
+            )
+
         elif five["adx"] < 18:
             entry_reason = "Waiting for ADX >= 18"
+
         elif five["volume_ratio"] < 1.15:
             entry_reason = "Waiting for volume confirmation"
+
         elif long_score >= short_score:
-            if not (five["ema9"] > five["ema21"] and five["ema21"] > five["ema50"]):
+            if not (
+                five["ema9"] > five["ema21"]
+                and five["ema21"] > five["ema50"]
+            ):
                 entry_reason = "Waiting for bullish 5m trend"
-            elif not (fifteen["ema9"] > fifteen["ema21"]):
+            elif not (
+                fifteen["ema9"] > fifteen["ema21"]
+            ):
                 entry_reason = "Waiting for bullish 15m confirmation"
             elif not 50 <= five["rsi"] <= 68:
                 entry_reason = "Waiting for bullish RSI confirmation"
@@ -937,10 +1386,16 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
                 entry_reason = "Price below 5m EMA21"
             else:
                 entry_reason = "Waiting for LONG setup"
+
         else:
-            if not (five["ema9"] < five["ema21"] and five["ema21"] < five["ema50"]):
+            if not (
+                five["ema9"] < five["ema21"]
+                and five["ema21"] < five["ema50"]
+            ):
                 entry_reason = "Waiting for bearish 5m trend"
-            elif not (fifteen["ema9"] < fifteen["ema21"]):
+            elif not (
+                fifteen["ema9"] < fifteen["ema21"]
+            ):
                 entry_reason = "Waiting for bearish 15m confirmation"
             elif not 32 <= five["rsi"] <= 50:
                 entry_reason = "Waiting for bearish RSI confirmation"
@@ -949,157 +1404,281 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
             else:
                 entry_reason = "Waiting for SHORT setup"
 
+    strong_signal = (
+        max(long_score, short_score) >= STRONG_ENTRY_SCORE
+    )
+
     return {
-        "long_score": long_score, "short_score": short_score,
+        "long_score": long_score,
+        "short_score": short_score,
         "signal": signal,
-        "strong_signal": max(long_score, short_score) >= STRONG_ENTRY_SCORE,
-        "entry_reason": entry_reason, "features": features
+        "strong_signal": strong_signal,
+        "entry_reason": entry_reason,
+        "features": features
     }
+
 
 # ============================================================
 # ACCOUNTING
 # ============================================================
 
 def position_gross_pnl(position, price):
-    entry, quantity = number(position.get("entry")), number(position.get("quantity"))
+    entry = number(position.get("entry"))
+    quantity = number(position.get("quantity"))
     direction = 1 if position.get("side") == "LONG" else -1
+
     return (price - entry) * quantity * direction
 
+
 def position_fees(position, price):
-    entry, quantity = number(position.get("entry")), number(position.get("quantity"))
-    return entry * quantity * FEE_RATE + price * quantity * FEE_RATE
+    entry = number(position.get("entry"))
+    quantity = number(position.get("quantity"))
+
+    return (
+        entry * quantity * FEE_RATE
+        + price * quantity * FEE_RATE
+    )
+
 
 def position_net_pnl(position, price):
-    return position_gross_pnl(position, price) - position_fees(position, price)
+    return (
+        position_gross_pnl(position, price)
+        - position_fees(position, price)
+    )
+
 
 def account_totals():
     with lock:
         balance = number(state["balance"])
         positions = [dict(p) for p in state["positions"]]
-    unrealized = sum(number(p.get("unrealized_pnl")) for p in positions)
-    used_margin = sum(number(p.get("margin")) for p in positions)
+
+    unrealized = sum(
+        number(p.get("unrealized_pnl")) for p in positions
+    )
+
+    used_margin = sum(
+        number(p.get("margin")) for p in positions
+    )
+
     return {
-        "balance": round(balance, 4), "unrealized": round(unrealized, 4),
+        "balance": round(balance, 4),
+        "unrealized": round(unrealized, 4),
         "equity": round(balance + unrealized, 4),
         "used_margin": round(used_margin, 4),
         "available_balance": round(balance - used_margin, 4)
     }
 
+
 # ============================================================
-# COOLDOWN + ENTRY DIAGNOSTICS
+# COOLDOWN
 # ============================================================
 
 def symbol_in_cooldown(symbol):
     with lock:
-        closed_at = number(state["last_closed_by_symbol"].get(symbol))
-    return closed_at > 0 and time.time() - closed_at < COOLDOWN_SECONDS
+        closed_at = number(
+            state["last_closed_by_symbol"].get(symbol)
+        )
+
+    if closed_at <= 0:
+        return False
+
+    return time.time() - closed_at < COOLDOWN_SECONDS
+
+
+# ============================================================
+# ENTRY DIAGNOSTICS
+# ============================================================
 
 def diagnose_entry(symbol, side, price, atr_value):
     if not PAPER_TRADING:
         return "BLOCKED", "Paper trading is disabled"
+
     if side not in ("LONG", "SHORT"):
         return "BLOCKED", "No valid LONG or SHORT signal"
+
     if price <= 0:
         return "BLOCKED", "Invalid entry price"
+
+    if atr_value <= 0:
+        return "BLOCKED", "ATR is zero or unavailable"
 
     with lock:
         if not state["running"]:
             return "BLOCKED", "Trading is stopped - press START TRADING"
+
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             return "BLOCKED", "Daily loss limit reached"
+
         if len(state["positions"]) >= MAX_POSITIONS:
-            return "BLOCKED", "Maximum open positions reached: " + str(MAX_POSITIONS)
-        if any(p.get("symbol") == symbol for p in state["positions"]):
+            return "BLOCKED", (
+                "Maximum open positions reached: "
+                + str(MAX_POSITIONS)
+            )
+
+        if any(
+            p.get("symbol") == symbol
+            for p in state["positions"]
+        ):
             return "BLOCKED", "A position is already open for this coin"
+
         balance = number(state["balance"])
+
         if balance <= 0:
             return "BLOCKED", "Paper account balance is zero or negative"
-        closed_at = number(state["last_closed_by_symbol"].get(symbol))
+
+        closed_at = number(
+            state["last_closed_by_symbol"].get(symbol)
+        )
 
     if closed_at > 0:
         remaining = COOLDOWN_SECONDS - (time.time() - closed_at)
-        if remaining > 0:
-            return "BLOCKED", "Symbol cooldown active: " + str(int(math.ceil(remaining))) + " seconds remaining"
 
+        if remaining > 0:
+            return "BLOCKED", (
+                "Symbol cooldown active: "
+                + str(int(math.ceil(remaining)))
+                + " seconds remaining"
+            )
+
+    # Position sizing is based on the fixed stop-loss distance.
     stop_distance = price * STOP_LOSS_PERCENT
     risk_amount = min(RISK_PER_TRADE, balance * 0.005)
-    quantity = risk_amount / stop_distance if stop_distance > 0 else 0
+    quantity = risk_amount / stop_distance
+
     max_notional = balance * MAX_EQUITY_EXPOSURE
-    quantity = min(quantity, max_notional / price) if price > 0 else 0
+    quantity = min(quantity, max_notional / price)
+
     if quantity <= 0:
         return "BLOCKED", "Calculated paper position quantity is zero"
-    margin = quantity * price / LEVERAGE
+
+    notional = quantity * price
+    margin = notional / LEVERAGE
+
     if margin > balance:
         return "BLOCKED", "Required margin exceeds paper account balance"
-    return "READY", "Entry checks passed - attempting to open paper position"
+
+    return "READY", (
+        "Entry checks passed - attempting to open paper position"
+    )
+
 
 # ============================================================
 # OPEN PAPER POSITION
 # ============================================================
 
 def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
-    if not PAPER_TRADING or side not in ("LONG", "SHORT") or price <= 0:
+    if not PAPER_TRADING or side not in ("LONG", "SHORT"):
         return False
+
+    if price <= 0 or atr_value <= 0:
+        return False
+
     if symbol_in_cooldown(symbol):
         log.info("COOLDOWN ACTIVE | %s", symbol)
         return False
 
     with lock:
-        if not state["running"] or len(state["positions"]) >= MAX_POSITIONS:
+        if not state["running"]:
             return False
-        if any(p.get("symbol") == symbol for p in state["positions"]):
+
+        if len(state["positions"]) >= MAX_POSITIONS:
+            log.info("MAX POSITIONS REACHED | %s", symbol)
             return False
+
+        if any(
+            p.get("symbol") == symbol
+            for p in state["positions"]
+        ):
+            log.info("POSITION ALREADY OPEN | %s", symbol)
+            return False
+
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             state["running"] = False
             log.warning("DAILY LOSS LIMIT REACHED")
             return False
+
         balance = number(state["balance"])
+
         if balance <= 0:
             return False
 
+        # Fixed 1.4% stop loss is also used for risk-based sizing.
         stop_distance = price * STOP_LOSS_PERCENT
-        target_distance = price * TAKE_PROFIT_PERCENT
-        risk_amount = min(RISK_PER_TRADE, balance * 0.005)
-        quantity = risk_amount / stop_distance if stop_distance > 0 else 0
+
+        risk_amount = min(
+            RISK_PER_TRADE,
+            balance * 0.005
+        )
+
+        quantity = risk_amount / stop_distance
+
         max_notional = balance * MAX_EQUITY_EXPOSURE
-        quantity = min(quantity, max_notional / price) if price > 0 else 0
+        quantity = min(quantity, max_notional / price)
+
         if quantity <= 0:
             return False
+
         notional = quantity * price
         margin = notional / LEVERAGE
+
         if margin > balance:
             return False
 
         if side == "LONG":
-            stop_price = price - stop_distance
-            target_price = price + target_distance
+            stop_price = price * (1 - STOP_LOSS_PERCENT)
+            target_price = price * (1 + TAKE_PROFIT_PERCENT)
         else:
-            stop_price = price + stop_distance
-            target_price = price - target_distance
+            stop_price = price * (1 + STOP_LOSS_PERCENT)
+            target_price = price * (1 - TAKE_PROFIT_PERCENT)
 
         position = {
-            "trade_id": uuid.uuid4().hex, "symbol": symbol, "side": side,
-            "entry": price, "current_price": price, "quantity": quantity,
-            "notional": notional, "margin": margin, "leverage": LEVERAGE,
-            "take_profit": target_price, "stop_loss": stop_price,
-            "stop_distance": stop_distance, "risk_amount": quantity * stop_distance,
-            "reward_risk": REWARD_RISK, "stop_loss_percent": STOP_LOSS_PERCENT,
-            "take_profit_percent": TAKE_PROFIT_PERCENT,
-            "opened": now_text(), "unrealized_pnl": 0.0,
-            "gross_unrealized_pnl": 0.0, "entry_fee": notional * FEE_RATE,
+            "trade_id": uuid.uuid4().hex,
+            "symbol": symbol,
+            "side": side,
+            "entry": price,
+            "current_price": price,
+            "quantity": quantity,
+            "notional": notional,
+            "margin": margin,
+            "leverage": LEVERAGE,
+            "take_profit": target_price,
+            "stop_loss": stop_price,
+            "stop_distance": stop_distance,
+            "risk_amount": quantity * stop_distance,
+            "reward_risk": TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT,
+            "opened": now_text(),
+            "unrealized_pnl": 0.0,
+            "gross_unrealized_pnl": 0.0,
+            "entry_fee": notional * FEE_RATE,
             "fee_rate": FEE_RATE,
-            "feature_snapshot": learning_snapshot_for_side(features or {}, side)
+            "feature_snapshot": learning_snapshot_for_side(
+                features or {}, side
+            )
         }
+
         state["positions"].append(position)
 
-    if not save_state():
-        log.error("CRITICAL: Supabase save failed after opening %s", position["trade_id"])
+    saved = save_state()
+
+    if not saved:
+        log.error(
+            "CRITICAL: position save failed after opening %s",
+            position["trade_id"]
+        )
         return False
+
     log.info(
         "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f (1.4%%) | TP %.8f (1.7%%) | Risk %.4f",
-        side, symbol, price, stop_price, target_price, position["risk_amount"]
+        side,
+        symbol,
+        price,
+        stop_price,
+        target_price,
+        position["risk_amount"]
     )
+
     return True
+
 
 # ============================================================
 # COMPLETED TRADE ENGINE
@@ -1108,74 +1687,137 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 def close_paper_position(position, price, reason):
     if not PAPER_TRADING or not isinstance(position, dict):
         return False
+
     trade_id = position.get("trade_id")
+
     if not trade_id or price <= 0:
         log.error("CLOSE FAILED: invalid ID or price")
         return False
 
     trade = None
     already_completed = False
+
     with lock:
-        live = next((p for p in state["positions"] if p.get("trade_id") == trade_id), None)
+        live = next(
+            (
+                p for p in state["positions"]
+                if p.get("trade_id") == trade_id
+            ),
+            None
+        )
+
         if live is None:
             return False
-        entry, quantity = number(live.get("entry")), number(live.get("quantity"))
+
+        entry = number(live.get("entry"))
+        quantity = number(live.get("quantity"))
+
         if entry <= 0 or quantity <= 0:
             live["state_error"] = "Invalid entry or quantity"
             log.error("CLOSE FAILED: invalid values | %s", trade_id)
             return False
 
-        existing = next((t for t in state["history"] if isinstance(t, dict) and t.get("trade_id") == trade_id), None)
+        existing = next(
+            (
+                t for t in state["history"]
+                if isinstance(t, dict)
+                and t.get("trade_id") == trade_id
+            ),
+            None
+        )
+
         if existing is not None:
             valid_existing = clean_trade(existing)
+
             if valid_existing is not None:
                 state["positions"].remove(live)
                 already_completed = True
             else:
-                state["history"] = [t for t in state["history"] if not (isinstance(t, dict) and t.get("trade_id") == trade_id)]
+                state["history"] = [
+                    t for t in state["history"]
+                    if not (
+                        isinstance(t, dict)
+                        and t.get("trade_id") == trade_id
+                    )
+                ]
 
         if not already_completed:
             gross = position_gross_pnl(live, price)
             fees = position_fees(live, price)
             net = gross - fees
+
             closed = now_text()
+
             trade = {
-                "trade_id": trade_id, "status": "COMPLETED",
-                "symbol": live.get("symbol", "UNKNOWN"), "side": live.get("side", "UNKNOWN"),
-                "entry": entry, "exit": price, "quantity": quantity,
-                "notional": number(live.get("notional"), entry * quantity),
-                "leverage": number(live.get("leverage"), LEVERAGE),
+                "trade_id": trade_id,
+                "status": "COMPLETED",
+                "symbol": live.get("symbol", "UNKNOWN"),
+                "side": live.get("side", "UNKNOWN"),
+                "entry": entry,
+                "exit": price,
+                "quantity": quantity,
+                "notional": number(
+                    live.get("notional"), entry * quantity
+                ),
+                "leverage": number(
+                    live.get("leverage"), LEVERAGE
+                ),
                 "margin": number(live.get("margin")),
-                "gross_pnl": round(gross, 6), "fees": round(fees, 6),
-                "pnl": round(net, 6), "net_pnl": round(net, 6),
-                "reason": reason, "opened": live.get("opened", ""), "closed": closed,
-                "feature_snapshot": dict(live.get("feature_snapshot", {}))
+                "gross_pnl": round(gross, 6),
+                "fees": round(fees, 6),
+                "pnl": round(net, 6),
+                "net_pnl": round(net, 6),
+                "reason": reason,
+                "opened": live.get("opened", ""),
+                "closed": closed,
+                "feature_snapshot": dict(
+                    live.get("feature_snapshot", {})
+                )
             }
+
             state["history"].insert(0, trade)
             state["history"] = state["history"][:MAX_HISTORY]
+
             state["balance"] += net
             state["daily_pnl"] += net
+
             symbol = live.get("symbol")
+
             if symbol:
                 state["last_closed_by_symbol"][symbol] = time.time()
+
             state["positions"].remove(live)
+
             if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
                 state["running"] = False
+
             log.info(
                 "TRADE COMPLETED | %s | %s | Gross %.4f | Fees %.4f | Net %.4f | ID %s",
-                symbol, reason, gross, fees, net, trade_id
+                symbol,
+                reason,
+                gross,
+                fees,
+                net,
+                trade_id
             )
 
     if not save_state():
-        log.error("CRITICAL: completed trade Supabase save failed | %s", trade_id)
+        log.error(
+            "CRITICAL: completed trade save failed | %s",
+            trade_id
+        )
         return False
+
     if already_completed:
         return True
+
     try:
         update_learning(trade)
     except Exception:
         log.exception("Learning update failed | %s", trade_id)
+
     return True
+
 
 # ============================================================
 # POSITION MONITOR
@@ -1184,24 +1826,49 @@ def close_paper_position(position, price, reason):
 def monitor_positions():
     with lock:
         positions = [dict(p) for p in state["positions"]]
+
     changed = False
+
     for position in positions:
         try:
             entry = number(position.get("entry"))
             quantity = number(position.get("quantity"))
             side = position.get("side")
-            if entry <= 0 or quantity <= 0 or side not in ("LONG", "SHORT"):
-                log.error("MONITOR SKIPPED INVALID POSITION | %s", position.get("trade_id"))
+
+            if (
+                entry <= 0
+                or quantity <= 0
+                or side not in ("LONG", "SHORT")
+            ):
+                log.error(
+                    "MONITOR SKIPPED INVALID POSITION | %s",
+                    position.get("trade_id")
+                )
                 continue
-            stop_price = number(position.get("stop_loss"))
-            target_price = number(position.get("take_profit"))
-            if stop_price <= 0 or target_price <= 0:
-                log.error("MONITOR SKIPPED: missing SL/TP | %s", position.get("trade_id"))
-                continue
+
+            # Always enforce fixed TP/SL on restored positions too.
+            if side == "LONG":
+                stop_price = entry * (1 - STOP_LOSS_PERCENT)
+                target_price = entry * (1 + TAKE_PROFIT_PERCENT)
+            else:
+                stop_price = entry * (1 + STOP_LOSS_PERCENT)
+                target_price = entry * (1 - TAKE_PROFIT_PERCENT)
+
+            # Correct any old saved ATR exit values.
+            position["stop_loss"] = stop_price
+            position["take_profit"] = target_price
+
+            with lock:
+                for live in state["positions"]:
+                    if live.get("trade_id") == position.get("trade_id"):
+                        live["stop_loss"] = stop_price
+                        live["take_profit"] = target_price
+                        break
 
             price = get_price(position["symbol"])
             net = position_net_pnl(position, price)
             gross = position_gross_pnl(position, price)
+
             with lock:
                 for live in state["positions"]:
                     if live.get("trade_id") == position.get("trade_id"):
@@ -1214,18 +1881,34 @@ def monitor_positions():
 
             if side == "LONG":
                 if price <= stop_price:
-                    close_paper_position(position, price, "STOP LOSS")
+                    close_paper_position(
+                        position, price, "STOP LOSS"
+                    )
                 elif price >= target_price:
-                    close_paper_position(position, price, "TAKE PROFIT")
+                    close_paper_position(
+                        position, price, "TAKE PROFIT"
+                    )
+
             else:
                 if price >= stop_price:
-                    close_paper_position(position, price, "STOP LOSS")
+                    close_paper_position(
+                        position, price, "STOP LOSS"
+                    )
                 elif price <= target_price:
-                    close_paper_position(position, price, "TAKE PROFIT")
+                    close_paper_position(
+                        position, price, "TAKE PROFIT"
+                    )
+
         except Exception as e:
-            log.exception("Monitor error for %s: %s", position.get("symbol"), e)
+            log.exception(
+                "Monitor error for %s: %s",
+                position.get("symbol"),
+                e
+            )
+
     if changed:
         save_state()
+
 
 # ============================================================
 # DAILY RISK
@@ -1234,13 +1917,24 @@ def monitor_positions():
 def risk_check():
     with lock:
         realized = number(state["daily_pnl"])
-        unrealized = sum(number(p.get("unrealized_pnl")) for p in state["positions"])
+
+        unrealized = sum(
+            number(p.get("unrealized_pnl"))
+            for p in state["positions"]
+        )
+
         total_daily_pnl = realized + unrealized
+
         if total_daily_pnl <= -DAILY_LOSS_LIMIT:
             state["running"] = False
-            log.warning("DAILY LOSS LIMIT REACHED | %.4f", total_daily_pnl)
+            log.warning(
+                "DAILY LOSS LIMIT REACHED | %.4f",
+                total_daily_pnl
+            )
             return False
+
     return True
+
 
 # ============================================================
 # PRIVATE ACCOUNT - READ ONLY
@@ -1251,21 +1945,43 @@ def check_private_account():
         with lock:
             state["private_status"] = "NOT CONFIGURED"
         return
+
     try:
-        result = check_bybit_result(private_api.get_wallet_balance(accountType="UNIFIED", coin="USDT"))
+        result = check_bybit_result(
+            private_api.get_wallet_balance(
+                accountType="UNIFIED",
+                coin="USDT"
+            )
+        )
+
         accounts = result.get("result", {}).get("list", [])
         wallet = None
+
         if accounts:
             coins = accounts[0].get("coin", [])
-            wallet = next((item for item in coins if item.get("coin") == "USDT"), None)
+            wallet = next(
+                (
+                    item for item in coins
+                    if item.get("coin") == "USDT"
+                ),
+                None
+            )
+
         with lock:
-            state["account_balance"] = number(wallet.get("walletBalance")) if wallet else 0.0
+            state["account_balance"] = (
+                number(wallet.get("walletBalance"))
+                if wallet else 0.0
+            )
             state["private_status"] = "CONNECTED - READ ONLY"
+
     except Exception as e:
         with lock:
             state["private_status"] = "CONNECTION FAILED"
+
         log.error("Private account error: %s", e)
+
     save_state()
+
 
 # ============================================================
 # SCANNER
@@ -1273,114 +1989,206 @@ def check_private_account():
 
 def scan_symbol(symbol):
     five_candles = get_candles(symbol, "5", 200)
-    fifteen_candles = get_candles(symbol, CONFIRMATION_INTERVAL, 120)
-    hourly_candles = get_candles(symbol, HIGHER_INTERVAL, 120)
+
+    fifteen_candles = get_candles(
+        symbol, CONFIRMATION_INTERVAL, 120
+    )
+
+    hourly_candles = get_candles(
+        symbol, HIGHER_INTERVAL, 120
+    )
+
     five = analyze_candles(five_candles)
     fifteen = analyze_candles(fifteen_candles)
     hourly = analyze_candles(hourly_candles)
+
     five["price"] = get_price(symbol)
 
     imbalance = get_orderbook(symbol)
     funding = get_funding(symbol)
     oi_change = get_open_interest(symbol)
-    signal = calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change)
+
+    signal = calculate_signal(
+        five,
+        fifteen,
+        hourly,
+        imbalance,
+        funding,
+        oi_change
+    )
 
     data = {
-        "symbol": symbol, "price": five["price"],
-        "rsi": round(five["rsi"], 2), "macd": round(five["macd"], 8),
-        "adx": round(five["adx"], 2), "atr": round(five["atr"], 8),
-        "ema9": round(five["ema9"], 8), "ema21": round(five["ema21"], 8),
-        "ema50": round(five["ema50"], 8), "volume_ratio": round(five["volume_ratio"], 2),
-        "orderbook_imbalance": round(imbalance, 3), "funding": funding,
+        "symbol": symbol,
+        "price": five["price"],
+        "rsi": round(five["rsi"], 2),
+        "macd": round(five["macd"], 8),
+        "adx": round(five["adx"], 2),
+        "atr": round(five["atr"], 8),
+        "ema9": round(five["ema9"], 8),
+        "ema21": round(five["ema21"], 8),
+        "ema50": round(five["ema50"], 8),
+        "volume_ratio": round(five["volume_ratio"], 2),
+        "orderbook_imbalance": round(imbalance, 3),
+        "funding": funding,
         "oi_change": round(oi_change, 3),
         "hourly_trend": (
-            "BULLISH" if hourly["ema9"] > hourly["ema21"] and hourly["ema21"] > hourly["ema50"]
-            else "BEARISH" if hourly["ema9"] < hourly["ema21"] and hourly["ema21"] < hourly["ema50"]
+            "BULLISH"
+            if hourly["ema9"] > hourly["ema21"]
+            and hourly["ema21"] > hourly["ema50"]
+            else "BEARISH"
+            if hourly["ema9"] < hourly["ema21"]
+            and hourly["ema21"] < hourly["ema50"]
             else "MIXED"
         ),
-        **signal, "updated": now_text(),
-        "entry_status": "WAITING", "entry_diagnostic": signal["entry_reason"]
+        **signal,
+        "updated": now_text(),
+        "entry_status": "WAITING",
+        "entry_diagnostic": signal["entry_reason"]
     }
 
     with lock:
         state["symbols"][symbol] = data
-        should_open = state["running"] and signal["signal"] in ("LONG", "SHORT")
+
+        should_open = (
+            state["running"]
+            and signal["signal"] in ("LONG", "SHORT")
+        )
 
     if not should_open:
         if signal["signal"] in ("LONG", "SHORT"):
-            status, diagnostic = diagnose_entry(symbol, signal["signal"], five["price"], five["atr"])
-            data["entry_status"], data["entry_diagnostic"] = status, diagnostic
+            status, diagnostic = diagnose_entry(
+                symbol,
+                signal["signal"],
+                five["price"],
+                five["atr"]
+            )
+            data["entry_status"] = status
+            data["entry_diagnostic"] = diagnostic
         else:
-            data["entry_status"], data["entry_diagnostic"] = "WAITING", signal["entry_reason"]
+            data["entry_status"] = "WAITING"
+            data["entry_diagnostic"] = signal["entry_reason"]
+
         with lock:
             state["symbols"][symbol] = data
+
         return data
 
-    status, diagnostic = diagnose_entry(symbol, signal["signal"], five["price"], five["atr"])
-    data["entry_status"], data["entry_diagnostic"] = status, diagnostic
+    status, diagnostic = diagnose_entry(
+        symbol,
+        signal["signal"],
+        five["price"],
+        five["atr"]
+    )
+
+    data["entry_status"] = status
+    data["entry_diagnostic"] = diagnostic
+
     if status == "READY":
-        opened = open_paper_position(symbol, signal["signal"], five["price"], signal["features"], five["atr"])
+        opened = open_paper_position(
+            symbol,
+            signal["signal"],
+            five["price"],
+            signal["features"],
+            five["atr"]
+        )
+
         if opened:
             data["entry_status"] = "OPENED"
-            data["entry_diagnostic"] = "Paper position opened successfully"
+            data["entry_diagnostic"] = (
+                "Paper position opened successfully"
+            )
         else:
             data["entry_status"] = "BLOCKED"
-            data["entry_diagnostic"] = "Pre-check passed, but position opening failed. Check Render logs for the exact reason."
-            log.warning("ENTRY OPEN FAILED | %s | %s", symbol, signal["signal"])
+            data["entry_diagnostic"] = (
+                "Pre-check passed, but position opening failed. "
+                "Check Render logs for the exact reason."
+            )
+
+            log.warning(
+                "ENTRY OPEN FAILED | %s | %s",
+                symbol,
+                signal["signal"]
+            )
+
     with lock:
         state["symbols"][symbol] = data
+
     return data
-    
-    # ============================================================
+
+
+# ============================================================
 # BACKGROUND WORKER
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.3 Supabase worker started")
+    log.info("CoinSentra V16.4 worker started")
     last_private_check = 0.0
+
     while True:
         cycle_start = time.time()
+
         try:
             reset_daily()
             monitor_positions()
+
             for symbol in SYMBOLS:
                 try:
                     scan_symbol(symbol)
+
                 except Exception as e:
                     log.exception("Scan failed for %s", symbol)
+
                     with lock:
                         existing = state["symbols"].get(symbol, {})
                         existing["data_error"] = str(e)[:180]
                         existing["entry_status"] = "SCAN ERROR"
-                        existing["entry_diagnostic"] = "Market scan failed: " + str(e)[:180]
+                        existing["entry_diagnostic"] = (
+                            "Market scan failed: " + str(e)[:180]
+                        )
                         existing["symbol"] = symbol
                         state["symbols"][symbol] = existing
+
             risk_check()
+
             with lock:
                 state["last_scan"] = now_text()
                 state["scan_count"] += 1
                 state["last_error"] = None
+
             save_state()
+
         except Exception as e:
             log.exception("Worker cycle failed")
+
             with lock:
                 state["last_error"] = str(e)[:250]
+
             save_state()
 
         if time.time() - last_private_check >= 300:
             check_private_account()
             last_private_check = time.time()
+
         elapsed = time.time() - cycle_start
         time.sleep(max(1, SCAN_SECONDS - elapsed))
 
+
 def start_worker_once():
     global worker_started
+
     with worker_lock:
         if worker_started:
             return
-        thread = threading.Thread(target=background_worker, name="CoinSentraV16Worker", daemon=True)
+
+        thread = threading.Thread(
+            target=background_worker,
+            name="CoinSentraV16Worker",
+            daemon=True
+        )
+
         thread.start()
         worker_started = True
+
 
 # ============================================================
 # PERFORMANCE STATISTICS
@@ -1388,50 +2196,91 @@ def start_worker_once():
 
 def trade_statistics():
     with lock:
-        trades = [dict(t) for t in state["history"] if clean_trade(t) is not None]
+        trades = [
+            dict(t) for t in state["history"]
+            if clean_trade(t) is not None
+        ]
+
     pnls = [number(t.get("pnl")) for t in trades]
+
     wins_list = [p for p in pnls if p > 0]
     losses_list = [p for p in pnls if p < 0]
-    wins, losses, count = len(wins_list), len(losses_list), len(pnls)
+
+    wins = len(wins_list)
+    losses = len(losses_list)
+    count = len(pnls)
+
     realized = sum(pnls)
     fees = sum(number(t.get("fees")) for t in trades)
+
     gross_wins = sum(wins_list)
     gross_losses = abs(sum(losses_list))
-    profit_factor = gross_wins / gross_losses if gross_losses > 0 else (gross_wins if gross_wins > 0 else 0.0)
-    average_win = gross_wins / wins if wins else 0.0
-    average_loss = gross_losses / losses if losses else 0.0
+
+    profit_factor = (
+        gross_wins / gross_losses
+        if gross_losses > 0
+        else gross_wins if gross_wins > 0 else 0.0
+    )
+
+    average_win = (
+        gross_wins / wins if wins else 0.0
+    )
+
+    average_loss = (
+        gross_losses / losses if losses else 0.0
+    )
+
     chronological = list(reversed(pnls))
-    running_equity = peak_equity = START_BALANCE
+    running_equity = START_BALANCE
+    peak_equity = START_BALANCE
     max_drawdown = 0.0
+
     for pnl in chronological:
         running_equity += pnl
         peak_equity = max(peak_equity, running_equity)
+
         if peak_equity > 0:
-            drawdown = (peak_equity - running_equity) / peak_equity * 100
+            drawdown = (
+                (peak_equity - running_equity)
+                / peak_equity * 100
+            )
             max_drawdown = max(max_drawdown, drawdown)
+
     return {
-        "completed_count": count, "wins": wins, "losses": losses,
+        "completed_count": count,
+        "wins": wins,
+        "losses": losses,
         "breakeven": count - wins - losses,
-        "win_rate": round(wins / count * 100, 2) if count else 0,
-        "history_realized_pnl": round(realized, 4), "total_fees": round(fees, 4),
+        "win_rate": round(
+            wins / count * 100, 2
+        ) if count else 0,
+        "history_realized_pnl": round(realized, 4),
+        "total_fees": round(fees, 4),
         "profit_factor": round(profit_factor, 3),
-        "average_win": round(average_win, 4), "average_loss": round(average_loss, 4),
+        "average_win": round(average_win, 4),
+        "average_loss": round(average_loss, 4),
         "max_drawdown": round(max_drawdown, 2)
     }
+
 
 def learning_statistics():
     with lock:
         learning = state["learning"]
+
         return {
-            "enabled": learning["enabled"], "samples": learning["samples"],
-            "updates": learning["updates"], "last_update": learning["last_update"],
+            "enabled": learning["enabled"],
+            "samples": learning["samples"],
+            "updates": learning["updates"],
+            "last_update": learning["last_update"],
             "last_result": learning["last_result"],
-            "minimum_samples": LEARNING_MIN_SAMPLES, "window": LEARNING_WINDOW,
+            "minimum_samples": LEARNING_MIN_SAMPLES,
+            "window": LEARNING_WINDOW,
             "weights": dict(learning["weights"])
         }
 
+
 # ============================================================
-# DASHBOARD HTML
+# DASHBOARD
 # ============================================================
 
 HTML = """
@@ -1440,7 +2289,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.3</title>
+<title>CoinSentra Trading Brain V16.4</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -1468,8 +2317,10 @@ th{color:#9bb0ce}
 </style>
 </head>
 <body>
+
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.3 | BYBIT | PAPER MODE ONLY | SUPABASE STORAGE</div>
+<div class="small">TRADING BRAIN V16.4 | BYBIT | PAPER MODE ONLY</div>
+
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
 <div class="card">Total Equity<div class="big" id="equity">$10,000</div></div>
@@ -1478,6 +2329,7 @@ th{color:#9bb0ce}
 <div class="card">Available Balance<div class="big" id="available">$10,000</div></div>
 <div class="card">Open Positions<div class="big" id="count">0</div></div>
 </div>
+
 <div class="card">
 <h2>CONTROL CENTER</h2>
 <button class="stop" onclick="control('stop')">END TRADING (C)</button>
@@ -1485,6 +2337,7 @@ th{color:#9bb0ce}
 <p id="control" class="small">Loading...</p>
 <p class="small">Stopping disables new entries. Existing paper positions remain monitored for TP and SL.</p>
 </div>
+
 <div class="card">
 <h2>ADAPTIVE AI LEARNING</h2>
 <div class="statgrid">
@@ -1497,6 +2350,7 @@ th{color:#9bb0ce}
 <h2>INDICATOR WEIGHTS</h2>
 <div id="weights" class="small">Waiting...</div>
 </div>
+
 <div class="card">
 <h2>TRADE PERFORMANCE</h2>
 <div class="statgrid">
@@ -1511,94 +2365,123 @@ th{color:#9bb0ce}
 <div class="stat"><span class="small">Maximum drawdown</span><strong id="drawdown">0%</strong></div>
 </div>
 </div>
+
 <div class="card">
 <h2>BYBIT CONNECTION</h2>
 <div id="private">Checking...</div>
 <div id="account" class="small"></div>
 <div class="small">Read-only wallet connection. No live orders are sent.</div>
 </div>
-<div class="card">
-<h2>STORAGE STATUS</h2>
-<div id="storage" class="small">Checking Supabase...</div>
-<div class="small">Supabase stores balance, open positions, completed trades and adaptive learning data.</div>
-</div>
+
 <div class="card">
 <h2>MARKET SCANNER</h2>
 <div id="scanner" class="small">WAITING FOR MARKET DATA</div>
 <div class="small">Entry threshold: 60 | Strong signal: 70+</div>
 <div class="scroll">
-<table><thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>1H TREND</th></tr></thead><tbody id="markets"></tbody></table>
+<table>
+<thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>1H TREND</th></tr></thead>
+<tbody id="markets"></tbody>
+</table>
 </div>
 </div>
+
 <div class="card">
 <h2>INDICATORS AND ENTRY STATUS</h2>
 <div id="indicators" class="small">Waiting for market data...</div>
 </div>
+
 <div class="card">
 <h2>OPEN PAPER POSITIONS</h2>
 <div class="scroll">
-<table><thead><tr><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>LIVE PRICE</th><th>NET PNL</th><th>MARGIN</th><th>TP</th><th>SL</th></tr></thead><tbody id="positions"></tbody></table>
+<table>
+<thead><tr><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>LIVE PRICE</th><th>NET PNL</th><th>MARGIN</th><th>TP</th><th>SL</th></tr></thead>
+<tbody id="positions"></tbody>
+</table>
 </div>
 </div>
+
 <div class="card">
 <h2>COMPLETED TRADE HISTORY</h2>
 <div class="small">Only closed trades appear here. Open trades are shown above.</div>
 <div class="scroll">
-<table><thead><tr><th>CLOSED</th><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>EXIT</th><th>GROSS PNL</th><th>FEES</th><th>NET PNL</th><th>REASON</th></tr></thead><tbody id="history"><tr><td colspan="9">No completed trades yet.</td></tr></tbody></table>
+<table>
+<thead><tr><th>CLOSED</th><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>EXIT</th><th>GROSS PNL</th><th>FEES</th><th>NET PNL</th><th>REASON</th></tr></thead>
+<tbody id="history"><tr><td colspan="9">No completed trades yet.</td></tr></tbody>
+</table>
 </div>
 </div>
+
 <div class="card small">
-Version 16.3 Supabase | 5m + 15m entry confirmation<br>
+Version 16.4 | 5m + 15m entry confirmation<br>
 1h trend contributes to score but is not mandatory<br>
 Entry score 60 | Strong signal 70+<br>
-Fixed stop-loss 1.4% | Fixed take-profit 1.7%<br>
-60-second re-entry cooldown | Paper trading only | Fee estimate 0.055% per side<br>
+Fixed stop loss 1.4% | Fixed take profit 1.7%<br>
+Paper trading only | Fee estimate 0.055% per side<br>
+Storage: <span id="storage">Checking...</span><br>
 Last scan: <span id="last">Waiting</span><br>
 Last error: <span id="error">None</span>
 </div>
+
 <script>
 async function control(action){
  const message=document.getElementById('control');
+
  if(action==='stop'){
   if(!confirm('End trading? New positions stop opening. Existing positions remain monitored.'))return;
  }
+
  message.textContent='Sending command...';
+
  try{
   const response=await fetch('/control/'+action,{method:'POST'});
   const data=await response.json();
   message.textContent=data.message||data.error||'Command received';
   update();
- }catch(e){message.textContent='Could not contact bot.';}
+ }catch(e){
+  message.textContent='Could not contact bot.';
+ }
 }
+
 document.addEventListener('keydown',function(e){
  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
  if(e.key.toLowerCase()==='c')control('stop');
  if(e.key.toLowerCase()==='v')control('start');
 });
+
 function money(x){return '$'+Number(x||0).toFixed(2);}
 function price(x){let n=Number(x||0);return n?n.toPrecision(8):'-';}
 function safe(x){
- return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ return String(x??'').replace(/[&<>"']/g,c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+ }[c]));
 }
 function color(x){return x==='LONG'?'green':x==='SHORT'?'red':'yellow';}
 function pnlColor(x){return Number(x)>=0?'green':'red';}
+
 async function update(){
  try{
   let r=await fetch('/api/data',{cache:'no-store'});
   if(!r.ok)throw new Error('API response error');
   let d=await r.json();
+
   document.getElementById('balance').textContent=money(d.balance);
   document.getElementById('equity').textContent=money(d.equity);
   document.getElementById('unrealized').textContent=money(d.unrealized);
   document.getElementById('daily').textContent=money(d.daily_pnl);
   document.getElementById('available').textContent=money(d.available_balance);
   document.getElementById('count').textContent=d.positions.length;
-  document.getElementById('control').textContent=d.running?'TRADING ACTIVE - NEW ENTRIES ENABLED':'TRADING ENDED - MONITORING OPEN POSITIONS';
+
+  document.getElementById('control').textContent=
+   d.running?'TRADING ACTIVE - NEW ENTRIES ENABLED':'TRADING ENDED - MONITORING OPEN POSITIONS';
+
   document.getElementById('private').textContent=d.private_status;
-  document.getElementById('account').textContent=d.account_balance===null?'Account balance unavailable':'Bybit USDT wallet: '+money(d.account_balance);
-  document.getElementById('storage').textContent=d.storage_status||'Unknown';
+  document.getElementById('account').textContent=
+   d.account_balance===null?'Account balance unavailable':'Bybit USDT wallet: '+money(d.account_balance);
+
   document.getElementById('last').textContent=d.last_scan||'Waiting';
   document.getElementById('error').textContent=d.last_error||'None';
+  document.getElementById('storage').textContent=d.storage_status||'Unknown';
+
   let s=d.stats;
   document.getElementById('completed').textContent=s.completed_count;
   document.getElementById('winrate').textContent=s.win_rate+'%';
@@ -1607,47 +2490,102 @@ async function update(){
   document.getElementById('realized').textContent=money(s.history_realized_pnl);
   document.getElementById('fees').textContent=money(s.total_fees);
   document.getElementById('profitfactor').textContent=s.profit_factor;
-  document.getElementById('averages').textContent=money(s.average_win)+' / '+money(s.average_loss);
+  document.getElementById('averages').textContent=
+   money(s.average_win)+' / '+money(s.average_loss);
   document.getElementById('drawdown').textContent=s.max_drawdown+'%';
+
   let learning=d.learning;
-  document.getElementById('learnsamples').textContent=learning.samples+'/'+learning.minimum_samples+' minimum';
+
+  document.getElementById('learnsamples').textContent=
+   learning.samples+'/'+learning.minimum_samples+' minimum';
   document.getElementById('learnupdates').textContent=learning.updates;
   document.getElementById('learnresult').textContent=learning.last_result||'Waiting';
-  document.getElementById('learnstatus').textContent=learning.samples>=learning.minimum_samples?'ADAPTIVE':'COLLECTING';
-  document.getElementById('learnmessage').textContent=learning.samples>=learning.minimum_samples
+  document.getElementById('learnstatus').textContent=
+   learning.samples>=learning.minimum_samples?'ADAPTIVE':'COLLECTING';
+
+  document.getElementById('learnmessage').textContent=
+   learning.samples>=learning.minimum_samples
    ?'Weights are adjusted using recent completed paper trades. Last update: '+(learning.last_update||'Not available')
    :'The engine needs '+Math.max(0,learning.minimum_samples-learning.samples)+' more eligible completed trades before its first adjustment.';
+
   let weightRows='';
   for(let [name,value] of Object.entries(learning.weights||{})){
    weightRows+=`<div class="weight"><span>${safe(name.replaceAll('_',' ').toUpperCase())}</span><b>${Number(value).toFixed(3)}x</b></div>`;
   }
   document.getElementById('weights').innerHTML=weightRows||'Waiting...';
+
   document.getElementById('scanner').textContent=d.last_scan?'ACTIVE':'WAITING';
-  let rows='',details='';
+
+  let rows='';
+  let details='';
+
   for(let s of Object.values(d.symbols)){
-   rows+=`<tr><td>${safe(s.symbol)}</td><td>${price(s.price)}</td><td class="green">${s.long_score??0}</td><td class="red">${s.short_score??0}</td><td class="${color(s.signal)}">${safe(s.signal||'WAIT')}</td><td>${safe(s.hourly_trend||'-')}</td></tr>`;
-   details+=`<p><b>${safe(s.symbol)}</b> | RSI ${s.rsi??'-'} | ADX ${s.adx??'-'} | ATR ${price(s.atr)} | Volume ${s.volume_ratio??'-'}x | Orderbook ${s.orderbook_imbalance??'-'} | Funding ${s.funding??'-'} | OI ${s.oi_change??'-'}%<br><b>Entry status:</b> ${safe(s.entry_status||'WAITING')}<br><b>Why:</b> ${safe(s.entry_diagnostic||s.entry_reason||'Waiting for scan')}<br><b>Signal reason:</b> ${safe(s.entry_reason||'Waiting')}<br><b>Strong signal:</b> ${s.strong_signal?'YES (70+)':'NO'}${s.data_error?' | ERROR: '+safe(s.data_error):''}</p>`;
+   rows+=`<tr>
+   <td>${safe(s.symbol)}</td><td>${price(s.price)}</td>
+   <td class="green">${s.long_score??0}</td>
+   <td class="red">${s.short_score??0}</td>
+   <td class="${color(s.signal)}">${safe(s.signal||'WAIT')}</td>
+   <td>${safe(s.hourly_trend||'-')}</td></tr>`;
+
+   details+=`<p><b>${safe(s.symbol)}</b> |
+   RSI ${s.rsi??'-'} | ADX ${s.adx??'-'} |
+   ATR ${price(s.atr)} |
+   Volume ${s.volume_ratio??'-'}x |
+   Orderbook ${s.orderbook_imbalance??'-'} |
+   Funding ${s.funding??'-'} |
+   OI ${s.oi_change??'-'}%<br>
+   <b>Entry status:</b> ${safe(s.entry_status||'WAITING')}<br>
+   <b>Why:</b> ${safe(s.entry_diagnostic||s.entry_reason||'Waiting for scan')}<br>
+   <b>Signal reason:</b> ${safe(s.entry_reason||'Waiting')}<br>
+   <b>Strong signal:</b> ${s.strong_signal?'YES (70+)':'NO'}
+   ${s.data_error?' | ERROR: '+safe(s.data_error):''}</p>`;
   }
-  document.getElementById('markets').innerHTML=rows||'<tr><td colspan="6">Waiting for first market scan</td></tr>';
-  document.getElementById('indicators').innerHTML=details||'Waiting for market data';
+
+  document.getElementById('markets').innerHTML=
+   rows||'<tr><td colspan="6">Waiting for first market scan</td></tr>';
+
+  document.getElementById('indicators').innerHTML=
+   details||'Waiting for market data';
+
   let positionRows='';
   for(let p of d.positions){
-   positionRows+=`<tr><td>${safe(p.symbol)}</td><td>${safe(p.side)}</td><td>${price(p.entry)}</td><td>${price(p.current_price)}</td><td class="${pnlColor(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td>${money(p.margin)}</td><td>${price(p.take_profit)}</td><td>${price(p.stop_loss)}</td></tr>`;
+   positionRows+=`<tr>
+    <td>${safe(p.symbol)}</td><td>${safe(p.side)}</td>
+    <td>${price(p.entry)}</td><td>${price(p.current_price)}</td>
+    <td class="${pnlColor(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td>
+    <td>${money(p.margin)}</td><td>${price(p.take_profit)}</td>
+    <td>${price(p.stop_loss)}</td></tr>`;
   }
-  document.getElementById('positions').innerHTML=positionRows||'<tr><td colspan="8">No open positions</td></tr>';
+
+  document.getElementById('positions').innerHTML=
+   positionRows||'<tr><td colspan="8">No open positions</td></tr>';
+
   let historyRows='';
   for(let p of d.history){
-   historyRows+=`<tr><td>${safe(p.closed||'-')}</td><td>${safe(p.symbol)}</td><td>${safe(p.side)}</td><td>${price(p.entry)}</td><td>${price(p.exit)}</td><td>${money(p.gross_pnl)}</td><td>${money(p.fees)}</td><td class="${pnlColor(p.pnl)}">${money(p.pnl)}</td><td>${safe(p.reason)}</td></tr>`;
+   historyRows+=`<tr>
+    <td>${safe(p.closed||'-')}</td><td>${safe(p.symbol)}</td>
+    <td>${safe(p.side)}</td><td>${price(p.entry)}</td>
+    <td>${price(p.exit)}</td><td>${money(p.gross_pnl)}</td>
+    <td>${money(p.fees)}</td>
+    <td class="${pnlColor(p.pnl)}">${money(p.pnl)}</td>
+    <td>${safe(p.reason)}</td></tr>`;
   }
-  document.getElementById('history').innerHTML=historyRows||'<tr><td colspan="9">No completed trades yet.</td></tr>';
- }catch(e){document.getElementById('scanner').textContent='CONNECTION ERROR';}
+
+  document.getElementById('history').innerHTML=
+   historyRows||'<tr><td colspan="9">No completed trades yet.</td></tr>';
+
+ }catch(e){
+  document.getElementById('scanner').textContent='CONNECTION ERROR';
+ }
 }
+
 update();
 setInterval(update,5000);
 </script>
 </body>
 </html>
 """
+
 
 # ============================================================
 # WEB ROUTES
@@ -1658,24 +2596,32 @@ def home():
     start_worker_once()
     return render_template_string(HTML)
 
+
 @app.route("/health")
 def health():
     start_worker_once()
+
     return jsonify({
-        "status": "ok", "version": VERSION, "paper_trading": True,
-        "storage": state.get("storage_status"),
-        "supabase_configured": supabase_configured()
+        "status": "ok",
+        "version": VERSION,
+        "paper_trading": True,
+        "supabase_enabled": SUPABASE_ENABLED
     })
+
 
 @app.route("/api/status")
 @app.route("/status")
 def status():
     start_worker_once()
+
     with lock:
         return jsonify({
-            "status": "ok", "version": state["version"],
-            "running": state["running"], "last_scan": state["last_scan"],
-            "last_error": state["last_error"], "symbols": state["symbols"],
+            "status": "ok",
+            "version": state["version"],
+            "running": state["running"],
+            "last_scan": state["last_scan"],
+            "last_error": state["last_error"],
+            "symbols": state["symbols"],
             "scan_count": state["scan_count"],
             "open_positions": len(state["positions"]),
             "completed_trades": len(state["history"]),
@@ -1683,16 +2629,22 @@ def status():
             "storage_status": state["storage_status"]
         })
 
+
 @app.route("/api/data")
 def api_data():
     start_worker_once()
+
     with lock:
         positions = [dict(p) for p in state["positions"]]
+
         history = []
+
         for item in state["history"]:
             trade = clean_trade(item)
+
             if trade:
                 history.append(trade)
+
         symbols = dict(state["symbols"])
         balance = number(state["balance"])
         daily_pnl = number(state["daily_pnl"])
@@ -1703,47 +2655,77 @@ def api_data():
         last_error = state["last_error"]
         storage_status = state["storage_status"]
 
-    unrealized = sum(number(p.get("unrealized_pnl")) for p in positions)
-    used_margin = sum(number(p.get("margin")) for p in positions)
+    unrealized = sum(
+        number(p.get("unrealized_pnl")) for p in positions
+    )
+
+    used_margin = sum(
+        number(p.get("margin")) for p in positions
+    )
+
     totals = {
-        "balance": round(balance, 4), "unrealized": round(unrealized, 4),
+        "balance": round(balance, 4),
+        "unrealized": round(unrealized, 4),
         "equity": round(balance + unrealized, 4),
         "available_balance": round(balance - used_margin, 4),
         "used_margin": round(used_margin, 4)
     }
+
     return jsonify({
-        **totals, "daily_pnl": round(daily_pnl + unrealized, 4),
-        "positions": positions, "history": history[:100],
-        "symbols": symbols, "running": running, "last_scan": last_scan,
-        "private_status": private_status, "account_balance": account_balance,
-        "last_error": last_error, "storage_status": storage_status,
-        "stats": trade_statistics(), "learning": learning_statistics()
+        **totals,
+        "daily_pnl": round(daily_pnl + unrealized, 4),
+        "positions": positions,
+        "history": history[:100],
+        "symbols": symbols,
+        "running": running,
+        "last_scan": last_scan,
+        "private_status": private_status,
+        "account_balance": account_balance,
+        "last_error": last_error,
+        "storage_status": storage_status,
+        "stats": trade_statistics(),
+        "learning": learning_statistics()
     })
+
 
 @app.route("/api/history")
 def api_history():
     with lock:
         history = []
+
         for item in state["history"]:
             trade = clean_trade(item)
+
             if trade:
                 history.append(trade)
+
     return jsonify({
-        "count": len(history), "history": history[:MAX_HISTORY],
+        "count": len(history),
+        "history": history[:MAX_HISTORY],
         "stats": trade_statistics()
     })
+
 
 @app.route("/control/stop", methods=["POST"])
 @app.route("/control/end", methods=["POST"])
 def stop():
     with lock:
         state["running"] = False
+
     save_state()
-    log.warning("TRADING ENDED BY USER - open positions remain monitored")
+
+    log.warning(
+        "TRADING ENDED BY USER - open positions remain monitored"
+    )
+
     return jsonify({
         "status": "stopped",
-        "message": "TRADING ENDED: new entries disabled. Existing positions are still monitored."
+        "message": (
+            "TRADING ENDED: new entries disabled. "
+            "Existing positions are still monitored."
+        )
     })
+
 
 @app.route("/control/start", methods=["POST"])
 def start():
@@ -1751,15 +2733,23 @@ def start():
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             return jsonify({
                 "status": "blocked",
-                "error": "Daily loss limit reached. Trading remains stopped."
+                "error": (
+                    "Daily loss limit reached. "
+                    "Trading remains stopped."
+                )
             }), 403
+
         state["running"] = True
+
     save_state()
+
     log.info("TRADING STARTED BY USER")
+
     return jsonify({
         "status": "started",
         "message": "TRADING STARTED: new paper entries enabled."
     })
+
 
 # ============================================================
 # STARTUP
@@ -1770,6 +2760,8 @@ recover_learning()
 
 if __name__ == "__main__":
     start_worker_once()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-    
-    
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080))
+    )
