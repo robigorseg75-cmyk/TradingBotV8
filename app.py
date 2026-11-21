@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -13,17 +12,18 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V15.1
+# COINSENTRA TRADING BRAIN V16.3
 # BYBIT | RENDER | PAPER TRADING ONLY
 # HISTORY RECOVERY | LEARNING RECOVERY
-# 5m + 15m + 1h CONFIRMATION
-# ATR STOPS | COOLDOWN | TRADE RECOVERY
+# 5m + 15m CONFIRMATION
+# 1h WEIGHTED - NOT MANDATORY
+# ATR STOPS | FASTER SCANNING | TRADE RECOVERY
 # ============================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("CoinSentraV15")
+log = logging.getLogger("CoinSentraV16")
 
 # ---------------- SETTINGS ----------------
 
@@ -31,15 +31,16 @@ SYMBOLS = ["ETHUSDT", "XRPUSDT", "SOLUSDT", "SUIUSDT"]
 CATEGORY = "linear"
 
 LEVERAGE = 8
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
 DAILY_LOSS_LIMIT = 10
 
 START_BALANCE = 10000.0
 RISK_PER_TRADE = 3.0
 MAX_EQUITY_EXPOSURE = 0.10
 
-SCAN_SECONDS = 30
+SCAN_SECONDS = 10
 ENTRY_SCORE = 60
+STRONG_ENTRY_SCORE = 70
 CONFIRMATION_INTERVAL = "15"
 HIGHER_INTERVAL = "60"
 
@@ -49,12 +50,12 @@ MIN_STOP_PERCENT = 0.004
 MAX_STOP_PERCENT = 0.015
 REWARD_RISK = 1.8
 
-COOLDOWN_SECONDS = 600
+COOLDOWN_SECONDS = 60
 
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "15.1"
+VERSION = "16.3"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -77,6 +78,9 @@ DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 # ---------------- STORAGE ----------------
 
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
+
+# Keep the existing filename so saved positions and history
+# from your previous version can be recovered.
 STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v15.json")
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
@@ -180,9 +184,6 @@ def clean_trade(trade):
 
     result = dict(trade)
 
-    # Stable ID for old trades without an ID.
-    # This avoids generating a different ID every time
-    # history is loaded or displayed.
     if not result.get("trade_id"):
         identity = {
             "symbol": result.get("symbol", ""),
@@ -281,13 +282,13 @@ def save_state():
         return True
 
     except Exception:
-        log.exception("V15.1 state save failed")
+        log.exception("V16.3 state save failed")
         return False
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        log.info("New V15.1 paper account")
+        log.info("New V16.3 paper account")
         return
 
     try:
@@ -323,7 +324,6 @@ def load_state():
                 state.get("balance"), START_BALANCE
             )
 
-            # Restore learning settings and processed trade IDs.
             saved_learning = saved.get("learning", {})
 
             if not isinstance(saved_learning, dict):
@@ -374,7 +374,6 @@ def load_state():
                 ][-2000:]
             }
 
-            # Clean and deduplicate completed history.
             cleaned_history = []
             seen_ids = set()
 
@@ -394,7 +393,6 @@ def load_state():
 
             state["history"] = cleaned_history[:MAX_HISTORY]
 
-            # Restore open positions.
             restored_positions = []
 
             for position in state["positions"]:
@@ -463,7 +461,7 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V15.1 RESTORED | positions=%s | completed=%s",
+            "V16.3 RESTORED | positions=%s | completed=%s",
             len(state["positions"]),
             len(state["history"])
         )
@@ -471,7 +469,7 @@ def load_state():
         save_state()
 
     except Exception:
-        log.exception("V15.1 state loading failed")
+        log.exception("V16.3 state loading failed")
 
 
 def reset_daily():
@@ -538,7 +536,6 @@ def update_learning(trade):
         if trade_id in processed:
             return
 
-        # Mark this trade as processed exactly once.
         processed.append(trade_id)
         learning["processed_trade_ids"] = processed[-2000:]
 
@@ -546,7 +543,6 @@ def update_learning(trade):
             learning.get("samples")
         ) + 1
 
-        # History is newest first; reverse it for chronological order.
         chronological = [
             clean_trade(item)
             for item in reversed(state["history"])
@@ -649,11 +645,6 @@ def update_learning(trade):
 
 
 def recover_learning():
-    """
-    Recover completed trades that were saved to history
-    but not yet processed by adaptive learning.
-    """
-
     if not LEARNING_ENABLED:
         return
 
@@ -767,7 +758,6 @@ def get_candles(symbol, interval, limit=200):
     if len(candles) < 60:
         raise ValueError("Insufficient candle history: " + symbol)
 
-    # Exclude currently forming candle.
     candles = candles[:-1]
 
     if len(candles) < 55:
@@ -1046,7 +1036,7 @@ def analyze_candles(candles):
 
 
 # ============================================================
-# V15 SIGNAL ENGINE
+# V16.3 SIGNAL ENGINE
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
@@ -1059,6 +1049,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         name: 0.0 for name in LEARNING_FEATURES
     }
 
+    # 5-minute fast trend
     if five["ema9"] > five["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
@@ -1067,6 +1058,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
 
+    # 5-minute slow trend
     if five["ema21"] > five["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
@@ -1075,6 +1067,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
+    # RSI
     if 50 <= five["rsi"] <= 68:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
@@ -1083,6 +1076,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
+    # MACD
     if five["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
@@ -1091,6 +1085,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["macd"] = -1
         short_score += 8 * weights["macd"]
 
+    # Volume
     if five["volume_ratio"] >= 1.15:
         if five["ema9"] > five["ema21"]:
             features["volume"] = 1
@@ -1100,6 +1095,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
             features["volume"] = -1
             short_score += 8 * weights["volume"]
 
+    # Order book
     if imbalance > 0.15:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
@@ -1108,6 +1104,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
+    # 15-minute confirmation
     if fifteen["ema9"] > fifteen["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
@@ -1116,6 +1113,8 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
+    # 1-hour trend remains a scoring factor,
+    # but is no longer a mandatory entry condition.
     if (
         hourly["ema9"] > hourly["ema21"]
         and hourly["ema21"] > hourly["ema50"]
@@ -1130,6 +1129,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
+    # ADX
     if five["adx"] >= 18:
         if five["ema9"] > five["ema21"]:
             features["adx"] = 1
@@ -1139,6 +1139,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
             features["adx"] = -1
             short_score += 6 * weights["adx"]
 
+    # Funding
     if funding > 0.0005:
         features["funding"] = -1
         short_score += 2 * weights["funding"]
@@ -1147,6 +1148,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["funding"] = 1
         long_score += 2 * weights["funding"]
 
+    # Open interest
     if oi_change > 0.2:
         if five["ema9"] > five["ema21"]:
             features["open_interest"] = 1
@@ -1160,51 +1162,103 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     short_score = min(100, round(short_score))
 
     signal = "WAIT"
+    entry_reason = "Waiting for a valid setup"
+
+    # 5m + 15m confirmation.
+    # 1h confirmation is intentionally not mandatory.
 
     long_confirmed = (
         five["ema9"] > five["ema21"]
         and five["ema21"] > five["ema50"]
         and fifteen["ema9"] > fifteen["ema21"]
-        and hourly["ema9"] > hourly["ema21"]
-        and hourly["ema21"] > hourly["ema50"]
         and five["rsi"] >= 50
         and five["rsi"] <= 68
         and five["adx"] >= 18
         and five["volume_ratio"] >= 1.15
+        and five["price"] > five["ema21"]
     )
 
     short_confirmed = (
         five["ema9"] < five["ema21"]
         and five["ema21"] < five["ema50"]
         and fifteen["ema9"] < fifteen["ema21"]
-        and hourly["ema9"] < hourly["ema21"]
-        and hourly["ema21"] < hourly["ema50"]
         and five["rsi"] >= 32
         and five["rsi"] <= 50
         and five["adx"] >= 18
         and five["volume_ratio"] >= 1.15
+        and five["price"] < five["ema21"]
     )
 
-    if (
-        long_score >= ENTRY_SCORE
-        and long_score - short_score >= 15
-        and long_confirmed
-        and five["price"] > five["ema21"]
-    ):
+    # LONG entry
+    if long_score >= ENTRY_SCORE and long_confirmed:
         signal = "LONG"
+        entry_reason = "LONG READY - 5m and 15m confirmed"
 
-    elif (
-        short_score >= ENTRY_SCORE
-        and short_score - long_score >= 15
-        and short_confirmed
-        and five["price"] < five["ema21"]
-    ):
+    # SHORT entry
+    elif short_score >= ENTRY_SCORE and short_confirmed:
         signal = "SHORT"
+        entry_reason = "SHORT READY - 5m and 15m confirmed"
+
+    # Explain why a signal has not qualified.
+    else:
+        best_score = max(long_score, short_score)
+
+        if best_score < ENTRY_SCORE:
+            entry_reason = (
+                "Score below entry threshold: "
+                + str(ENTRY_SCORE)
+            )
+
+        elif five["adx"] < 18:
+            entry_reason = "Waiting for ADX >= 18"
+
+        elif five["volume_ratio"] < 1.15:
+            entry_reason = "Waiting for volume confirmation"
+
+        elif long_score >= short_score:
+            if not (
+                five["ema9"] > five["ema21"]
+                and five["ema21"] > five["ema50"]
+            ):
+                entry_reason = "Waiting for bullish 5m trend"
+            elif not (
+                fifteen["ema9"] > fifteen["ema21"]
+            ):
+                entry_reason = "Waiting for bullish 15m confirmation"
+            elif not 50 <= five["rsi"] <= 68:
+                entry_reason = "Waiting for bullish RSI confirmation"
+            elif five["price"] <= five["ema21"]:
+                entry_reason = "Price below 5m EMA21"
+            else:
+                entry_reason = "Waiting for LONG setup"
+
+        else:
+            if not (
+                five["ema9"] < five["ema21"]
+                and five["ema21"] < five["ema50"]
+            ):
+                entry_reason = "Waiting for bearish 5m trend"
+            elif not (
+                fifteen["ema9"] < fifteen["ema21"]
+            ):
+                entry_reason = "Waiting for bearish 15m confirmation"
+            elif not 32 <= five["rsi"] <= 50:
+                entry_reason = "Waiting for bearish RSI confirmation"
+            elif five["price"] >= five["ema21"]:
+                entry_reason = "Price above 5m EMA21"
+            else:
+                entry_reason = "Waiting for SHORT setup"
+
+    strong_signal = (
+        max(long_score, short_score) >= STRONG_ENTRY_SCORE
+    )
 
     return {
         "long_score": long_score,
         "short_score": short_score,
         "signal": signal,
+        "strong_signal": strong_signal,
+        "entry_reason": entry_reason,
         "features": features
     }
 
@@ -1296,16 +1350,19 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             return False
 
         if len(state["positions"]) >= MAX_POSITIONS:
+            log.info("MAX POSITIONS REACHED | %s", symbol)
             return False
 
         if any(
             p.get("symbol") == symbol
             for p in state["positions"]
         ):
+            log.info("POSITION ALREADY OPEN | %s", symbol)
             return False
 
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             state["running"] = False
+            log.warning("DAILY LOSS LIMIT REACHED")
             return False
 
         balance = number(state["balance"])
@@ -1522,7 +1579,6 @@ def close_paper_position(position, price, reason):
                 trade_id
             )
 
-    # Save history and position removal together.
     if not save_state():
         log.error(
             "CRITICAL: completed trade save failed | %s",
@@ -1766,13 +1822,20 @@ def scan_symbol(symbol):
         )
 
     if should_open:
-        open_paper_position(
+        opened = open_paper_position(
             symbol,
             signal["signal"],
             five["price"],
             signal["features"],
             five["atr"]
         )
+
+        if not opened:
+            log.info(
+                "ENTRY NOT OPENED | %s | %s",
+                symbol,
+                signal["signal"]
+            )
 
     return data
 
@@ -1782,7 +1845,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V15.1 worker started")
+    log.info("CoinSentra V16.3 worker started")
     last_private_check = 0.0
 
     while True:
@@ -1839,7 +1902,7 @@ def start_worker_once():
 
         thread = threading.Thread(
             target=background_worker,
-            name="CoinSentraV15Worker",
+            name="CoinSentraV16Worker",
             daemon=True
         )
 
@@ -1946,7 +2009,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V15.1</title>
+<title>CoinSentra Trading Brain V16.3</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -1976,7 +2039,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V15.1 | BYBIT | PAPER MODE ONLY</div>
+<div class="small">TRADING BRAIN V16.3 | BYBIT | PAPER MODE ONLY</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2033,6 +2096,7 @@ th{color:#9bb0ce}
 <div class="card">
 <h2>MARKET SCANNER</h2>
 <div id="scanner" class="small">WAITING FOR MARKET DATA</div>
+<div class="small">Entry threshold: 60 | Strong signal: 70+</div>
 <div class="scroll">
 <table>
 <thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>1H TREND</th></tr></thead>
@@ -2042,7 +2106,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card">
-<h2>INDICATORS</h2>
+<h2>INDICATORS AND ENTRY STATUS</h2>
 <div id="indicators" class="small">Waiting for market data...</div>
 </div>
 
@@ -2068,8 +2132,10 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 15.1 | 5m + 15m + 1h confirmation<br>
-ATR stop | 1.8:1 target/risk | 10-minute re-entry cooldown<br>
+Version 16.3 | 5m + 15m entry confirmation<br>
+1h trend contributes to score but is not mandatory<br>
+Entry score 60 | Strong signal 70+<br>
+ATR stop | 1.8:1 target/risk | 60-second re-entry cooldown<br>
 Paper trading only | Fee estimate 0.055% per side<br>
 Last scan: <span id="last">Waiting</span><br>
 Last error: <span id="error">None</span>
@@ -2185,7 +2251,9 @@ async function update(){
    Volume ${s.volume_ratio??'-'}x |
    Orderbook ${s.orderbook_imbalance??'-'} |
    Funding ${s.funding??'-'} |
-   OI ${s.oi_change??'-'}%
+   OI ${s.oi_change??'-'}%<br>
+   <b>Entry status:</b> ${safe(s.entry_reason||'Waiting')}<br>
+   <b>Strong signal:</b> ${s.strong_signal?'YES (70+)':'NO'}
    ${s.data_error?' | ERROR: '+safe(s.data_error):''}</p>`;
   }
 
