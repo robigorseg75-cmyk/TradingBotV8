@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -18,6 +19,7 @@ from pybit.unified_trading import HTTP
 # 5m + 15m CONFIRMATION
 # 1h WEIGHTED - NOT MANDATORY
 # ATR STOPS | FASTER SCANNING | TRADE RECOVERY
+# ENTRY DIAGNOSTICS ADDED
 # ============================================================
 
 app = Flask(__name__)
@@ -78,9 +80,6 @@ DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 # ---------------- STORAGE ----------------
 
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
-
-# Keep the existing filename so saved positions and history
-# from your previous version can be recovered.
 STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v15.json")
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
@@ -1049,7 +1048,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         name: 0.0 for name in LEARNING_FEATURES
     }
 
-    # 5-minute fast trend
     if five["ema9"] > five["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
@@ -1058,7 +1056,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
 
-    # 5-minute slow trend
     if five["ema21"] > five["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
@@ -1067,7 +1064,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
-    # RSI
     if 50 <= five["rsi"] <= 68:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
@@ -1076,7 +1072,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
-    # MACD
     if five["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
@@ -1085,7 +1080,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["macd"] = -1
         short_score += 8 * weights["macd"]
 
-    # Volume
     if five["volume_ratio"] >= 1.15:
         if five["ema9"] > five["ema21"]:
             features["volume"] = 1
@@ -1095,7 +1089,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
             features["volume"] = -1
             short_score += 8 * weights["volume"]
 
-    # Order book
     if imbalance > 0.15:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
@@ -1104,7 +1097,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
-    # 15-minute confirmation
     if fifteen["ema9"] > fifteen["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
@@ -1113,8 +1105,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    # 1-hour trend remains a scoring factor,
-    # but is no longer a mandatory entry condition.
     if (
         hourly["ema9"] > hourly["ema21"]
         and hourly["ema21"] > hourly["ema50"]
@@ -1129,7 +1119,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
-    # ADX
     if five["adx"] >= 18:
         if five["ema9"] > five["ema21"]:
             features["adx"] = 1
@@ -1139,7 +1128,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
             features["adx"] = -1
             short_score += 6 * weights["adx"]
 
-    # Funding
     if funding > 0.0005:
         features["funding"] = -1
         short_score += 2 * weights["funding"]
@@ -1148,7 +1136,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["funding"] = 1
         long_score += 2 * weights["funding"]
 
-    # Open interest
     if oi_change > 0.2:
         if five["ema9"] > five["ema21"]:
             features["open_interest"] = 1
@@ -1163,9 +1150,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
 
     signal = "WAIT"
     entry_reason = "Waiting for a valid setup"
-
-    # 5m + 15m confirmation.
-    # 1h confirmation is intentionally not mandatory.
 
     long_confirmed = (
         five["ema9"] > five["ema21"]
@@ -1189,17 +1173,14 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         and five["price"] < five["ema21"]
     )
 
-    # LONG entry
     if long_score >= ENTRY_SCORE and long_confirmed:
         signal = "LONG"
         entry_reason = "LONG READY - 5m and 15m confirmed"
 
-    # SHORT entry
     elif short_score >= ENTRY_SCORE and short_confirmed:
         signal = "SHORT"
         entry_reason = "SHORT READY - 5m and 15m confirmed"
 
-    # Explain why a signal has not qualified.
     else:
         best_score = max(long_score, short_score)
 
@@ -1328,6 +1309,100 @@ def symbol_in_cooldown(symbol):
         return False
 
     return time.time() - closed_at < COOLDOWN_SECONDS
+
+
+# ============================================================
+# ENTRY DIAGNOSTICS - NEW
+# Explains why a valid signal did not open a paper trade.
+# Does not change the signal score or entry strategy.
+# ============================================================
+
+def diagnose_entry(symbol, side, price, atr_value):
+    if not PAPER_TRADING:
+        return "BLOCKED", "Paper trading is disabled"
+
+    if side not in ("LONG", "SHORT"):
+        return "BLOCKED", "No valid LONG or SHORT signal"
+
+    if price <= 0:
+        return "BLOCKED", "Invalid entry price"
+
+    if atr_value <= 0:
+        return "BLOCKED", "ATR is zero or unavailable"
+
+    with lock:
+        if not state["running"]:
+            return "BLOCKED", "Trading is stopped - press START TRADING"
+
+        if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
+            return "BLOCKED", "Daily loss limit reached"
+
+        if len(state["positions"]) >= MAX_POSITIONS:
+            return "BLOCKED", (
+                "Maximum open positions reached: "
+                + str(MAX_POSITIONS)
+            )
+
+        if any(
+            p.get("symbol") == symbol
+            for p in state["positions"]
+        ):
+            return "BLOCKED", "A position is already open for this coin"
+
+        balance = number(state["balance"])
+
+        if balance <= 0:
+            return "BLOCKED", "Paper account balance is zero or negative"
+
+        closed_at = number(
+            state["last_closed_by_symbol"].get(symbol)
+        )
+
+    if closed_at > 0:
+        remaining = COOLDOWN_SECONDS - (time.time() - closed_at)
+
+        if remaining > 0:
+            return "BLOCKED", (
+                "Symbol cooldown active: "
+                + str(int(math.ceil(remaining)))
+                + " seconds remaining"
+            )
+
+    raw_stop = atr_value * ATR_STOP_MULTIPLIER
+    minimum_stop = price * MIN_STOP_PERCENT
+    maximum_stop = price * MAX_STOP_PERCENT
+    stop_distance = max(raw_stop, minimum_stop)
+
+    if stop_distance > maximum_stop:
+        stop_percent = (stop_distance / price) * 100
+        max_percent = MAX_STOP_PERCENT * 100
+
+        return "BLOCKED", (
+            "ATR stop too wide: "
+            + str(round(stop_percent, 3))
+            + "%; maximum allowed is "
+            + str(round(max_percent, 3))
+            + "%"
+        )
+
+    risk_amount = min(RISK_PER_TRADE, balance * 0.005)
+    quantity = risk_amount / stop_distance
+
+    max_notional = balance * MAX_EQUITY_EXPOSURE
+    quantity = min(quantity, max_notional / price)
+
+    if quantity <= 0:
+        return "BLOCKED", "Calculated paper position quantity is zero"
+
+    notional = quantity * price
+    margin = notional / LEVERAGE
+
+    if margin > balance:
+        return "BLOCKED", "Required margin exceeds paper account balance"
+
+    return "READY", (
+        "Entry checks passed - attempting to open paper position"
+    )
 
 
 # ============================================================
@@ -1810,7 +1885,9 @@ def scan_symbol(symbol):
             else "MIXED"
         ),
         **signal,
-        "updated": now_text()
+        "updated": now_text(),
+        "entry_status": "WAITING",
+        "entry_diagnostic": signal["entry_reason"]
     }
 
     with lock:
@@ -1821,7 +1898,36 @@ def scan_symbol(symbol):
             and signal["signal"] in ("LONG", "SHORT")
         )
 
-    if should_open:
+    if not should_open:
+        if signal["signal"] in ("LONG", "SHORT"):
+            status, diagnostic = diagnose_entry(
+                symbol,
+                signal["signal"],
+                five["price"],
+                five["atr"]
+            )
+            data["entry_status"] = status
+            data["entry_diagnostic"] = diagnostic
+        else:
+            data["entry_status"] = "WAITING"
+            data["entry_diagnostic"] = signal["entry_reason"]
+
+        with lock:
+            state["symbols"][symbol] = data
+
+        return data
+
+    status, diagnostic = diagnose_entry(
+        symbol,
+        signal["signal"],
+        five["price"],
+        five["atr"]
+    )
+
+    data["entry_status"] = status
+    data["entry_diagnostic"] = diagnostic
+
+    if status == "READY":
         opened = open_paper_position(
             symbol,
             signal["signal"],
@@ -1830,12 +1936,26 @@ def scan_symbol(symbol):
             five["atr"]
         )
 
-        if not opened:
-            log.info(
-                "ENTRY NOT OPENED | %s | %s",
+        if opened:
+            data["entry_status"] = "OPENED"
+            data["entry_diagnostic"] = (
+                "Paper position opened successfully"
+            )
+        else:
+            data["entry_status"] = "BLOCKED"
+            data["entry_diagnostic"] = (
+                "Pre-check passed, but position opening failed. "
+                "Check Render logs for the exact reason."
+            )
+
+            log.warning(
+                "ENTRY OPEN FAILED | %s | %s",
                 symbol,
                 signal["signal"]
             )
+
+    with lock:
+        state["symbols"][symbol] = data
 
     return data
 
@@ -1865,6 +1985,10 @@ def background_worker():
                     with lock:
                         existing = state["symbols"].get(symbol, {})
                         existing["data_error"] = str(e)[:180]
+                        existing["entry_status"] = "SCAN ERROR"
+                        existing["entry_diagnostic"] = (
+                            "Market scan failed: " + str(e)[:180]
+                        )
                         existing["symbol"] = symbol
                         state["symbols"][symbol] = existing
 
@@ -2252,7 +2376,9 @@ async function update(){
    Orderbook ${s.orderbook_imbalance??'-'} |
    Funding ${s.funding??'-'} |
    OI ${s.oi_change??'-'}%<br>
-   <b>Entry status:</b> ${safe(s.entry_reason||'Waiting')}<br>
+   <b>Entry status:</b> ${safe(s.entry_status||'WAITING')}<br>
+   <b>Why:</b> ${safe(s.entry_diagnostic||s.entry_reason||'Waiting for scan')}<br>
+   <b>Signal reason:</b> ${safe(s.entry_reason||'Waiting')}<br>
    <b>Strong signal:</b> ${s.strong_signal?'YES (70+)':'NO'}
    ${s.data_error?' | ERROR: '+safe(s.data_error):''}</p>`;
   }
