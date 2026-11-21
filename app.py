@@ -41,7 +41,7 @@ LEVERAGE = 8
 MAX_POSITIONS = 3
 DAILY_LOSS_LIMIT = 10
 
-START_BALANCE = 10000.0
+START_BALANCE = 1000
 RISK_PER_TRADE = 3.0
 MAX_EQUITY_EXPOSURE = 0.10
 
@@ -111,8 +111,8 @@ private_api = None
 
 if API_KEY and API_SECRET:
     private_api = HTTP(
-        api_key=API_KEY,
-        api_secret=API_SECRET,
+        api_key=vA9UkYkaoBHPySdPT9 
+        api_secret=8uZSZDZdn8ra8xX4ephBuI7yOkyLpGKyot7h
         testnet=False,
         timeout=15
     )
