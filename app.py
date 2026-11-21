@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -6,18 +7,19 @@ import logging
 import math
 import uuid
 import hashlib
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone, date
 
 from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.4
-# BYBIT | RENDER | SUPABASE | PAPER TRADING ONLY
-# CLOUD STATE RECOVERY | LEARNING RECOVERY
-# FIXED TP 1.7% | FIXED SL 1.4%
+#BOT SENTRA TRADING BRAIN V16.3
+# BYBIT | RENDER | PAPER TRADING ONLY
+# HISTORY RECOVERY | LEARNING RECOVERY
+# 5m + 15m CONFIRMATION
+# 1h WEIGHTED - NOT MANDATORY
+# ATR STOPS | FASTER SCANNING | TRADE RECOVERY
+# ENTRY DIAGNOSTICS ADDED
 # ============================================================
 
 app = Flask(__name__)
@@ -41,7 +43,7 @@ LEVERAGE = 8
 MAX_POSITIONS = 3
 DAILY_LOSS_LIMIT = 10
 
-START_BALANCE = 1000
+START_BALANCE = 10000.0
 RISK_PER_TRADE = 3.0
 MAX_EQUITY_EXPOSURE = 0.10
 
@@ -57,16 +59,12 @@ MIN_STOP_PERCENT = 0.004
 MAX_STOP_PERCENT = 0.015
 REWARD_RISK = 1.8
 
-# FIXED EXIT SETTINGS
-TAKE_PROFIT_PERCENT = 0.017
-STOP_LOSS_PERCENT = 0.014
-
 COOLDOWN_SECONDS = 30
 
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "16.4"
+VERSION = "16.3"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -89,17 +87,7 @@ DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 # ---------------- STORAGE ----------------
 
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
-STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v16.json")
-
-# SUPABASE CLOUD PERSISTENCE
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-SUPABASE_STATE_ID = os.getenv(
-    "SUPABASE_STATE_ID", "coinsentra_v16"
-).strip()
-
-SUPABASE_TABLE = "coinsentra_state"
-SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v15.json")
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
@@ -111,8 +99,8 @@ private_api = None
 
 if API_KEY and API_SECRET:
     private_api = HTTP(
-        api_key="vA9UkYkaoBHPySdPT9"" 
-        api_secret="8uZSZDZdn8ra8xX4ephBuI7yOkyLpGKyot7h""
+        api_key=API_KEY,
+        api_secret=API_SECRET,
         testnet=False,
         timeout=15
     )
@@ -139,7 +127,6 @@ state = {
     "scan_count": 0,
     "last_closed_by_symbol": {},
     "version": VERSION,
-    "storage_status": "SUPABASE NOT CONFIGURED",
     "learning": {
         "enabled": LEARNING_ENABLED,
         "weights": dict(DEFAULT_WEIGHTS),
@@ -188,92 +175,6 @@ def check_bybit_result(result):
         )
 
     return result
-
-
-# ============================================================
-# SUPABASE CLOUD STORAGE
-# ============================================================
-
-def supabase_request(method, endpoint, payload=None):
-    if not SUPABASE_ENABLED:
-        raise RuntimeError("Supabase is not configured")
-
-    url = SUPABASE_URL + "/rest/v1/" + endpoint
-
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": "Bearer " + SUPABASE_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    if method in ("POST", "PATCH"):
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-
-    body = None
-
-    if payload is not None:
-        body = json.dumps(payload, allow_nan=False).encode("utf-8")
-
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers=headers,
-        method=method
-    )
-
-    with urllib.request.urlopen(request, timeout=15) as response:
-        raw = response.read().decode("utf-8", errors="replace")
-
-        if not raw:
-            return None
-
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return raw
-
-
-def supabase_load_state():
-    if not SUPABASE_ENABLED:
-        return None
-
-    endpoint = (
-        SUPABASE_TABLE
-        + "?id=eq."
-        + urllib.parse.quote(SUPABASE_STATE_ID, safe="")
-        + "&select=data&limit=1"
-    )
-
-    result = supabase_request("GET", endpoint)
-
-    if isinstance(result, list) and result:
-        row = result[0]
-
-        if isinstance(row, dict) and isinstance(row.get("data"), dict):
-            log.info("SUPABASE STATE FOUND")
-            return row["data"]
-
-    log.info("SUPABASE STATE ROW NOT FOUND")
-    return None
-
-
-def supabase_save_state(snapshot):
-    if not SUPABASE_ENABLED:
-        return False
-
-    payload = {
-        "id": SUPABASE_STATE_ID,
-        "data": snapshot,
-        "updated_at": now_text()
-    }
-
-    endpoint = SUPABASE_TABLE + "?on_conflict=id"
-
-    supabase_request("POST", endpoint, payload)
-
-    log.info("SUPABASE CLOUD SAVE SUCCESS")
-    return True
 
 
 # ============================================================
@@ -345,125 +246,64 @@ def clean_trade(trade):
 
 def save_state():
     """
-    Save to Supabase cloud and local fallback.
+    Atomic save.
     Lock order: storage_lock, then lock.
     Never call this while already holding lock.
     """
 
     try:
         with storage_lock:
+            os.makedirs(DATA_DIR, exist_ok=True)
+
             with lock:
                 snapshot = json.loads(
                     json.dumps(state, allow_nan=False)
                 )
 
-            cloud_saved = False
-
-            if SUPABASE_ENABLED:
-                try:
-                    cloud_saved = supabase_save_state(snapshot)
-
-                except Exception as cloud_error:
-                    log.exception("SUPABASE CLOUD SAVE FAILED")
-
-                    with lock:
-                        state["storage_status"] = (
-                            "CLOUD SAVE FAILED: "
-                            + str(cloud_error)[:160]
-                        )
-
-            # Local backup/fallback save
-            local_saved = False
+            temp_file = STATE_FILE + "." + uuid.uuid4().hex + ".tmp"
 
             try:
-                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(
+                        snapshot,
+                        f,
+                        indent=2,
+                        allow_nan=False
+                    )
+                    f.flush()
+                    os.fsync(f.fileno())
 
-                temp_file = (
-                    STATE_FILE + "." + uuid.uuid4().hex + ".tmp"
-                )
+                os.replace(temp_file, STATE_FILE)
 
-                try:
-                    with open(temp_file, "w", encoding="utf-8") as f:
-                        json.dump(
-                            snapshot,
-                            f,
-                            indent=2,
-                            allow_nan=False
-                        )
-                        f.flush()
-                        os.fsync(f.fileno())
+            finally:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
 
-                    os.replace(temp_file, STATE_FILE)
-                    local_saved = True
+        log.info(
+            "STATE SAVED | positions=%s | history=%s",
+            len(snapshot.get("positions", [])),
+            len(snapshot.get("history", []))
+        )
 
-                finally:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-
-            except Exception:
-                log.exception("LOCAL STATE SAVE FAILED")
-
-            with lock:
-                if cloud_saved:
-                    state["storage_status"] = "SUPABASE CLOUD SAVED"
-                elif local_saved:
-                    state["storage_status"] = "LOCAL BACKUP ONLY"
-                elif not SUPABASE_ENABLED:
-                    state["storage_status"] = "SUPABASE NOT CONFIGURED"
-                else:
-                    state["storage_status"] = "CLOUD AND LOCAL SAVE FAILED"
-
-            log.info(
-                "STATE SAVE | cloud=%s | local=%s | positions=%s | history=%s",
-                cloud_saved,
-                local_saved,
-                len(snapshot.get("positions", [])),
-                len(snapshot.get("history", []))
-            )
-
-            return cloud_saved or local_saved
+        return True
 
     except Exception:
-        log.exception("V16.4 state save failed")
+        log.exception("V16.3 state save failed")
         return False
 
 
 def load_state():
-    saved = None
-    loaded_from = "NONE"
-
-    # Cloud is the primary source.
-    if SUPABASE_ENABLED:
-        try:
-            saved = supabase_load_state()
-
-            if saved is not None:
-                loaded_from = "SUPABASE"
-
-        except Exception:
-            log.exception("SUPABASE LOAD FAILED")
-
-    # Use local backup only if cloud has no usable state.
-    if saved is None:
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-
-                loaded_from = "LOCAL BACKUP"
-
-            except Exception:
-                log.exception("LOCAL STATE LOAD FAILED")
-
-        else:
-            log.info("No existing paper account state found")
-            return
-
-    if not isinstance(saved, dict):
-        log.error("Saved state is not a dictionary")
+    if not os.path.exists(STATE_FILE):
+        log.info("New V16.3 paper account")
         return
 
     try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+
+        if not isinstance(saved, dict):
+            raise ValueError("Saved state is not a dictionary")
+
         with lock:
             for key in (
                 "balance", "positions", "history", "daily_pnl",
@@ -581,29 +421,29 @@ def load_state():
                 entry = number(position.get("entry"))
                 side = position.get("side")
 
-                # Recover fixed percentage exits for old saved positions.
                 if entry > 0 and side in ("LONG", "SHORT"):
-                    if side == "LONG":
-                        position["stop_loss"] = entry * (
-                            1 - STOP_LOSS_PERCENT
-                        )
-                        position["take_profit"] = entry * (
-                            1 + TAKE_PROFIT_PERCENT
-                        )
-                    else:
-                        position["stop_loss"] = entry * (
-                            1 + STOP_LOSS_PERCENT
-                        )
-                        position["take_profit"] = entry * (
-                            1 - TAKE_PROFIT_PERCENT
+                    stop_distance = number(
+                        position.get("stop_distance")
+                    )
+
+                    if stop_distance <= 0:
+                        stop_distance = entry * MIN_STOP_PERCENT
+
+                    if number(position.get("stop_loss")) <= 0:
+                        position["stop_loss"] = (
+                            entry - stop_distance
+                            if side == "LONG"
+                            else entry + stop_distance
                         )
 
-                    position["stop_distance"] = (
-                        entry * STOP_LOSS_PERCENT
-                    )
-                    position["reward_risk"] = (
-                        TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT
-                    )
+                    if number(position.get("take_profit")) <= 0:
+                        position["take_profit"] = (
+                            entry + stop_distance * REWARD_RISK
+                            if side == "LONG"
+                            else entry - stop_distance * REWARD_RISK
+                        )
+
+                    position["stop_distance"] = stop_distance
 
                 if (
                     entry <= 0
@@ -625,24 +465,17 @@ def load_state():
 
             state["positions"] = restored_positions
             state["version"] = VERSION
-            state["storage_status"] = (
-                "RESTORED FROM " + loaded_from
-            )
 
         log.info(
-            "V16.4 RESTORED FROM %s | positions=%s | completed=%s",
-            loaded_from,
+            "V16.3 RESTORED | positions=%s | completed=%s",
             len(state["positions"]),
             len(state["history"])
         )
 
-        # If recovered from local backup, migrate immediately to cloud.
-        if SUPABASE_ENABLED and loaded_from == "LOCAL BACKUP":
-            log.info("MIGRATING LOCAL STATE TO SUPABASE")
-            save_state()
+        save_state()
 
     except Exception:
-        log.exception("V16.4 state loading failed")
+        log.exception("V16.3 state loading failed")
 
 
 def reset_daily():
@@ -813,8 +646,8 @@ def update_learning(trade):
     if not save_state():
         log.error(
             "LEARNING SAVE FAILED | trade=%s",
-        trade_id
-    )
+            trade_id
+        )
 
 
 def recover_learning():
@@ -1209,7 +1042,7 @@ def analyze_candles(candles):
 
 
 # ============================================================
-# V16.4 SIGNAL ENGINE
+# V16.3 SIGNAL ENGINE
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
@@ -1486,7 +1319,9 @@ def symbol_in_cooldown(symbol):
 
 
 # ============================================================
-# ENTRY DIAGNOSTICS
+# ENTRY DIAGNOSTICS - NEW
+# Explains why a valid signal did not open a paper trade.
+# Does not change the signal score or entry strategy.
 # ============================================================
 
 def diagnose_entry(symbol, side, price, atr_value):
@@ -1540,8 +1375,23 @@ def diagnose_entry(symbol, side, price, atr_value):
                 + " seconds remaining"
             )
 
-    # Position sizing is based on the fixed stop-loss distance.
-    stop_distance = price * STOP_LOSS_PERCENT
+    raw_stop = atr_value * ATR_STOP_MULTIPLIER
+    minimum_stop = price * MIN_STOP_PERCENT
+    maximum_stop = price * MAX_STOP_PERCENT
+    stop_distance = max(raw_stop, minimum_stop)
+
+    if stop_distance > maximum_stop:
+        stop_percent = (stop_distance / price) * 100
+        max_percent = MAX_STOP_PERCENT * 100
+
+        return "BLOCKED", (
+            "ATR stop too wide: "
+            + str(round(stop_percent, 3))
+            + "%; maximum allowed is "
+            + str(round(max_percent, 3))
+            + "%"
+        )
+
     risk_amount = min(RISK_PER_TRADE, balance * 0.005)
     quantity = risk_amount / stop_distance
 
@@ -1602,8 +1452,18 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if balance <= 0:
             return False
 
-        # Fixed 1.4% stop loss is also used for risk-based sizing.
-        stop_distance = price * STOP_LOSS_PERCENT
+        raw_stop = atr_value * ATR_STOP_MULTIPLIER
+        minimum_stop = price * MIN_STOP_PERCENT
+        maximum_stop = price * MAX_STOP_PERCENT
+
+        stop_distance = max(raw_stop, minimum_stop)
+
+        if stop_distance > maximum_stop:
+            log.info(
+                "ENTRY SKIPPED | %s | ATR stop too wide",
+                symbol
+            )
+            return False
 
         risk_amount = min(
             RISK_PER_TRADE,
@@ -1625,11 +1485,11 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             return False
 
         if side == "LONG":
-            stop_price = price * (1 - STOP_LOSS_PERCENT)
-            target_price = price * (1 + TAKE_PROFIT_PERCENT)
+            stop_price = price - stop_distance
+            target_price = price + stop_distance * REWARD_RISK
         else:
-            stop_price = price * (1 + STOP_LOSS_PERCENT)
-            target_price = price * (1 - TAKE_PROFIT_PERCENT)
+            stop_price = price + stop_distance
+            target_price = price - stop_distance * REWARD_RISK
 
         position = {
             "trade_id": uuid.uuid4().hex,
@@ -1645,7 +1505,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             "stop_loss": stop_price,
             "stop_distance": stop_distance,
             "risk_amount": quantity * stop_distance,
-            "reward_risk": TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT,
+            "reward_risk": REWARD_RISK,
             "opened": now_text(),
             "unrealized_pnl": 0.0,
             "gross_unrealized_pnl": 0.0,
@@ -1668,7 +1528,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         return False
 
     log.info(
-        "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f (1.4%%) | TP %.8f (1.7%%) | Risk %.4f",
+        "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f | TP %.8f | Risk %.4f",
         side,
         symbol,
         price,
@@ -1846,24 +1706,15 @@ def monitor_positions():
                 )
                 continue
 
-            # Always enforce fixed TP/SL on restored positions too.
-            if side == "LONG":
-                stop_price = entry * (1 - STOP_LOSS_PERCENT)
-                target_price = entry * (1 + TAKE_PROFIT_PERCENT)
-            else:
-                stop_price = entry * (1 + STOP_LOSS_PERCENT)
-                target_price = entry * (1 - TAKE_PROFIT_PERCENT)
+            stop_price = number(position.get("stop_loss"))
+            target_price = number(position.get("take_profit"))
 
-            # Correct any old saved ATR exit values.
-            position["stop_loss"] = stop_price
-            position["take_profit"] = target_price
-
-            with lock:
-                for live in state["positions"]:
-                    if live.get("trade_id") == position.get("trade_id"):
-                        live["stop_loss"] = stop_price
-                        live["take_profit"] = target_price
-                        break
+            if stop_price <= 0 or target_price <= 0:
+                log.error(
+                    "MONITOR SKIPPED: missing SL/TP | %s",
+                    position.get("trade_id")
+                )
+                continue
 
             price = get_price(position["symbol"])
             net = position_net_pnl(position, price)
@@ -2121,7 +1972,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.4 worker started")
+    log.info("CoinSentra V16.3 worker started")
     last_private_check = 0.0
 
     while True:
@@ -2289,7 +2140,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.4</title>
+<title>CoinSentra Trading Brain V16.3</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -2319,7 +2170,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.4 | BYBIT | PAPER MODE ONLY</div>
+<div class="small">TRADING BRAIN V16.3 | BYBIT | PAPER MODE ONLY</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2412,12 +2263,11 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.4 | 5m + 15m entry confirmation<br>
+Version 16.3 | 5m + 15m entry confirmation<br>
 1h trend contributes to score but is not mandatory<br>
 Entry score 60 | Strong signal 70+<br>
-Fixed stop loss 1.4% | Fixed take profit 1.7%<br>
+ATR stop | 1.8:1 target/risk | 60-second re-entry cooldown<br>
 Paper trading only | Fee estimate 0.055% per side<br>
-Storage: <span id="storage">Checking...</span><br>
 Last scan: <span id="last">Waiting</span><br>
 Last error: <span id="error">None</span>
 </div>
@@ -2480,7 +2330,6 @@ async function update(){
 
   document.getElementById('last').textContent=d.last_scan||'Waiting';
   document.getElementById('error').textContent=d.last_error||'None';
-  document.getElementById('storage').textContent=d.storage_status||'Unknown';
 
   let s=d.stats;
   document.getElementById('completed').textContent=s.completed_count;
@@ -2604,8 +2453,7 @@ def health():
     return jsonify({
         "status": "ok",
         "version": VERSION,
-        "paper_trading": True,
-        "supabase_enabled": SUPABASE_ENABLED
+        "paper_trading": True
     })
 
 
@@ -2625,8 +2473,7 @@ def status():
             "scan_count": state["scan_count"],
             "open_positions": len(state["positions"]),
             "completed_trades": len(state["history"]),
-            "learning": state["learning"],
-            "storage_status": state["storage_status"]
+            "learning": state["learning"]
         })
 
 
@@ -2653,7 +2500,6 @@ def api_data():
         private_status = state["private_status"]
         account_balance = state["account_balance"]
         last_error = state["last_error"]
-        storage_status = state["storage_status"]
 
     unrealized = sum(
         number(p.get("unrealized_pnl")) for p in positions
@@ -2682,7 +2528,6 @@ def api_data():
         "private_status": private_status,
         "account_balance": account_balance,
         "last_error": last_error,
-        "storage_status": storage_status,
         "stats": trade_statistics(),
         "learning": learning_statistics()
     })
