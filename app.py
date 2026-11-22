@@ -14,12 +14,13 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.6
+# COINSENTRA TRADING BRAIN V16.7
 # BYBIT | RENDER | SUPABASE | PAPER TRADING
 # RELIABLE STATE | FRESH SCANNER | EASIER ENTRIES
+# CANDLESTICK PATTERN RECOGNITION
 # ============================================================
 
-VERSION = "16.6"
+VERSION = "16.7"
 
 SYMBOLS = [
     "ETHUSDT",
@@ -70,6 +71,10 @@ LEARNING_WINDOW = 30
 LEARNING_MIN_WEIGHT = 0.75
 LEARNING_MAX_WEIGHT = 1.25
 LEARNING_RATE = 0.15
+
+# Candlestick settings
+CANDLE_PATTERN_SCORE = 8
+CANDLE_STRONG_PATTERN_SCORE = 10
 
 # ============================================================
 # ENVIRONMENT
@@ -289,8 +294,8 @@ def supabase_load():
         url = (
             SUPABASE_URL
             + "/rest/v1/coinsentra_state"
-            + "?select=state& id=eq.main"
-        ).replace("?select=state& id", "?select=state&id")
+            + "?select=state&id=eq.main"
+        )
 
         result = http_json(
             url,
@@ -420,7 +425,6 @@ def load_state():
             position["stop_loss"] = number(position.get("stop_loss"))
             position["take_profit"] = number(position.get("take_profit"))
 
-            # Preserve existing position SL/TP values.
             if position["entry"] > 0:
                 if position["stop_loss"] <= 0:
                     position["stop_loss"] = (
@@ -834,6 +838,244 @@ def adx_approx(candles, period=14):
 
     return abs(plus_di - minus_di) / total * 100
 
+# ============================================================
+# CANDLESTICK PATTERN RECOGNITION
+# ============================================================
+
+def candle_parts(candle):
+    open_price = candle["open"]
+    close_price = candle["close"]
+    high = candle["high"]
+    low = candle["low"]
+
+    body = abs(close_price - open_price)
+    candle_range = max(high - low, 1e-12)
+    upper_wick = high - max(open_price, close_price)
+    lower_wick = min(open_price, close_price) - low
+
+    return {
+        "body": body,
+        "range": candle_range,
+        "upper": max(0, upper_wick),
+        "lower": max(0, lower_wick),
+        "bullish": close_price > open_price,
+        "bearish": close_price < open_price,
+        "body_ratio": body / candle_range,
+        "upper_ratio": max(0, upper_wick) / candle_range,
+        "lower_ratio": max(0, lower_wick) / candle_range
+    }
+
+def detect_candlestick_patterns(candles):
+    """
+    Detect patterns using completed candles only.
+
+    Returns:
+        bullish patterns
+        bearish patterns
+        neutral patterns
+        directional score
+        display text
+    """
+
+    result = {
+        "bullish": [],
+        "bearish": [],
+        "neutral": [],
+        "score": 0,
+        "signal": "NEUTRAL",
+        "display": "No pattern"
+    }
+
+    if len(candles) < 5:
+        return result
+
+    c1 = candles[-1]
+    c2 = candles[-2]
+    c3 = candles[-3]
+
+    p1 = candle_parts(c1)
+    p2 = candle_parts(c2)
+    p3 = candle_parts(c3)
+
+    body1 = p1["body"]
+    body2 = p2["body"]
+    body3 = p3["body"]
+
+    range1 = p1["range"]
+    range2 = p2["range"]
+    range3 = p3["range"]
+
+    # --------------------------
+    # BULLISH PATTERNS
+    # --------------------------
+
+    # Bullish engulfing
+    if (
+        p2["bearish"]
+        and p1["bullish"]
+        and c1["open"] <= c2["close"]
+        and c1["close"] >= c2["open"]
+        and body1 >= body2 * 1.05
+    ):
+        result["bullish"].append("Bullish Engulfing")
+
+    # Hammer
+    if (
+        p1["lower"] >= body1 * 2
+        and p1["upper"] <= body1 * 0.6
+        and p1["body_ratio"] <= 0.45
+        and p1["lower_ratio"] >= 0.50
+    ):
+        result["bullish"].append("Hammer")
+
+    # Morning star
+    if (
+        p3["bearish"]
+        and p3["body_ratio"] > 0.5
+        and p2["body_ratio"] < 0.35
+        and p1["bullish"]
+        and c1["close"] > (c3["open"] + c3["close"]) / 2
+    ):
+        result["bullish"].append("Morning Star")
+
+    # Three white soldiers
+    if len(candles) >= 4:
+        a = candles[-4]
+        b = candles[-3]
+        c = candles[-2]
+        d = candles[-1]
+
+        pa = candle_parts(a)
+        pb = candle_parts(b)
+        pc = candle_parts(c)
+        pd = candle_parts(d)
+
+        if (
+            pb["bullish"]
+            and pc["bullish"]
+            and pd["bullish"]
+            and b["close"] > a["close"]
+            and c["close"] > b["close"]
+            and d["close"] > c["close"]
+            and pb["body_ratio"] > 0.45
+            and pc["body_ratio"] > 0.45
+            and pd["body_ratio"] > 0.45
+        ):
+            result["bullish"].append("Three White Soldiers")
+
+    # --------------------------
+    # BEARISH PATTERNS
+    # --------------------------
+
+    # Bearish engulfing
+    if (
+        p2["bullish"]
+        and p1["bearish"]
+        and c1["open"] >= c2["close"]
+        and c1["close"] <= c2["open"]
+        and body1 >= body2 * 1.05
+    ):
+        result["bearish"].append("Bearish Engulfing")
+
+    # Shooting star
+    if (
+        p1["upper"] >= body1 * 2
+        and p1["lower"] <= body1 * 0.6
+        and p1["body_ratio"] <= 0.45
+        and p1["upper_ratio"] >= 0.50
+    ):
+        result["bearish"].append("Shooting Star")
+
+    # Evening star
+    if (
+        p3["bullish"]
+        and p3["body_ratio"] > 0.5
+        and p2["body_ratio"] < 0.35
+        and p1["bearish"]
+        and c1["close"] < (c3["open"] + c3["close"]) / 2
+    ):
+        result["bearish"].append("Evening Star")
+
+    # Three black crows
+    if len(candles) >= 4:
+        a = candles[-4]
+        b = candles[-3]
+        c = candles[-2]
+        d = candles[-1]
+
+        pa = candle_parts(a)
+        pb = candle_parts(b)
+        pc = candle_parts(c)
+        pd = candle_parts(d)
+
+        if (
+            pb["bearish"]
+            and pc["bearish"]
+            and pd["bearish"]
+            and c["close"] < b["close"]
+            and d["close"] < c["close"]
+            and pb["body_ratio"] > 0.45
+            and pc["body_ratio"] > 0.45
+            and pd["body_ratio"] > 0.45
+        ):
+            result["bearish"].append("Three Black Crows")
+
+    # --------------------------
+    # NEUTRAL PATTERNS
+    # --------------------------
+
+    # Doji
+    if p1["body_ratio"] <= 0.10:
+        result["neutral"].append("Doji")
+
+    # Long lower wick
+    if p1["lower_ratio"] >= 0.55:
+        result["neutral"].append("Long Lower Wick")
+
+    # Long upper wick
+    if p1["upper_ratio"] >= 0.55:
+        result["neutral"].append("Long Upper Wick")
+
+    bullish_count = len(result["bullish"])
+    bearish_count = len(result["bearish"])
+
+    # Pattern score
+    result["score"] = (
+        bullish_count * CANDLE_PATTERN_SCORE
+        - bearish_count * CANDLE_PATTERN_SCORE
+    )
+
+    if "Three White Soldiers" in result["bullish"]:
+        result["score"] += CANDLE_STRONG_PATTERN_SCORE
+
+    if "Three Black Crows" in result["bearish"]:
+        result["score"] -= CANDLE_STRONG_PATTERN_SCORE
+
+    if result["score"] > 0:
+        result["signal"] = "BULLISH"
+    elif result["score"] < 0:
+        result["signal"] = "BEARISH"
+    else:
+        result["signal"] = "NEUTRAL"
+
+    all_patterns = (
+        result["bullish"]
+        + result["bearish"]
+        + result["neutral"]
+    )
+
+    result["display"] = (
+        " | ".join(all_patterns)
+        if all_patterns
+        else "No pattern"
+    )
+
+    return result
+
+# ============================================================
+# CANDLE ANALYSIS
+# ============================================================
+
 def analyze_candles(candles):
     closes = [x["close"] for x in candles]
     volumes = [x["volume"] for x in candles]
@@ -871,11 +1113,20 @@ def analyze_candles(candles):
     }
 
 # ============================================================
-# SIGNAL ENGINE - SLIGHTLY EASIER ENTRIES
+# SIGNAL ENGINE - EASIER ENTRIES + CANDLE PATTERNS
 # ============================================================
 
-def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
+def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candle_patterns=None):
     weights = get_learning_weights()
+
+    candle_patterns = candle_patterns or {
+        "bullish": [],
+        "bearish": [],
+        "neutral": [],
+        "score": 0,
+        "signal": "NEUTRAL",
+        "display": "No pattern"
+    }
 
     long_score = 0.0
     short_score = 0.0
@@ -896,7 +1147,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
-    # Easier RSI range
     if 48 <= five["rsi"] <= 70:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
@@ -946,7 +1196,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
-    # Slightly easier trend strength
     if fifteen["adx"] >= 16:
         if fifteen["ema9"] > fifteen["ema21"]:
             features["adx"] = 1
@@ -969,6 +1218,14 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         elif fifteen["ema9"] < fifteen["ema21"]:
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
+
+    # Candlestick pattern contribution
+    candle_score = number(candle_patterns.get("score"))
+
+    if candle_score > 0:
+        long_score += candle_score
+    elif candle_score < 0:
+        short_score += abs(candle_score)
 
     long_score = min(100, round(long_score))
     short_score = min(100, round(short_score))
@@ -1013,7 +1270,13 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         "long_score": long_score,
         "short_score": short_score,
         "signal": signal,
-        "features": features
+        "features": features,
+        "candle_pattern": candle_patterns.get("display", "No pattern"),
+        "candle_signal": candle_patterns.get("signal", "NEUTRAL"),
+        "candle_score": candle_score,
+        "bullish_patterns": candle_patterns.get("bullish", []),
+        "bearish_patterns": candle_patterns.get("bearish", []),
+        "neutral_patterns": candle_patterns.get("neutral", [])
     }
 
 # ============================================================
@@ -1240,7 +1503,6 @@ def close_paper_position(position, price, reason):
             "feature_snapshot": dict(live.get("feature_snapshot", {}))
         }
 
-        # Save transaction rollback snapshot
         old_balance = state["balance"]
         old_daily = state["daily_pnl"]
         old_history = list(state["history"])
@@ -1402,12 +1664,21 @@ def scan_symbol(symbol):
 
     fifteen["price"] = get_price(symbol)
 
+    # Detect patterns from completed 5-minute candles
+    candle_patterns = detect_candlestick_patterns(five_candles)
+
     imbalance = get_orderbook(symbol)
     funding = get_funding(symbol)
     oi_change = get_open_interest(symbol)
 
     signal = calculate_signal(
-        five, fifteen, fifteen, imbalance, funding, oi_change
+        five,
+        fifteen,
+        fifteen,
+        imbalance,
+        funding,
+        oi_change,
+        candle_patterns
     )
 
     trend = (
@@ -1446,8 +1717,11 @@ def scan_symbol(symbol):
 
     if should_open:
         open_paper_position(
-            symbol, signal["signal"], fifteen["price"],
-            signal["features"], fifteen["atr"]
+            symbol,
+            signal["signal"],
+            fifteen["price"],
+            signal["features"],
+            fifteen["atr"]
         )
 
     return data
@@ -1457,7 +1731,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.6 worker started")
+    log.info("CoinSentra V16.7 worker started")
 
     last_private_check = 0.0
 
@@ -1601,7 +1875,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.6</title>
+<title>CoinSentra Trading Brain V16.7</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -1625,12 +1899,13 @@ th{color:#9bb0ce}
 .stat{background:#0c1728;border-radius:8px;padding:10px}
 .stat strong{display:block;font-size:18px;margin-top:5px}
 .weight{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #293a50}
+.pattern{font-weight:bold}
 </style>
 </head>
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.6 | BYBIT | PAPER MODE ONLY | 5M RSI + 15M TREND | MAX 3 POSITIONS</div>
+<div class="small">TRADING BRAIN V16.7 | BYBIT | PAPER MODE ONLY | 5M RSI + 15M TREND + CANDLE PATTERNS | MAX 3 POSITIONS</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -1696,7 +1971,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card">
-<h2>INDICATORS (5M RSI / 15M TREND)</h2>
+<h2>INDICATORS (5M RSI / 15M TREND / CANDLE PATTERNS)</h2>
 <div id="indicators" class="small">Waiting for market data...</div>
 </div>
 
@@ -1722,7 +1997,8 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.6 | Easier entry scoring<br>
+Version 16.7 | Easier entry scoring + candlestick recognition<br>
+Patterns: Engulfing, Hammer, Shooting Star, Morning/Evening Star, Three Soldiers/Crows, Doji, Wicks<br>
 Maximum 3 positions | Minimum $60 notional<br>
 Stop loss 1.4% | Take profit 1.7%<br>
 60-second cooldown | Paper trading only<br>
@@ -1838,7 +2114,8 @@ async function update(){
    15M Volume ${s.volume_ratio??'-'}x |
    Orderbook ${s.orderbook_imbalance??'-'} |
    Funding ${s.funding??'-'} |
-   OI ${s.oi_change??'-'}%
+   OI ${s.oi_change??'-'}% |
+   <span class="pattern">CANDLE: ${safe(s.candle_pattern||'No pattern')} (${safe(s.candle_signal||'NEUTRAL')})</span>
    ${s.data_error?' | ERROR: '+safe(s.data_error):''}</p>`;
   }
 
