@@ -14,19 +14,12 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.5
-# BYBIT | RENDER | SUPABASE | PAPER TRADING ONLY
-# 5M RSI CONFIRMATION | 15M TREND CONFIRMATION
-# FIXED SL/TP | HISTORY RECOVERY | 3 POSITIONS
-# MINIMUM $60 PER TRADE | BALANCE CHECK
+# COINSENTRA TRADING BRAIN V16.6
+# BYBIT | RENDER | SUPABASE | PAPER TRADING
+# RELIABLE STATE | FRESH SCANNER | EASIER ENTRIES
 # ============================================================
 
-app = Flask(__name__)
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("CoinSentraV16")
-
-# ---------------- SETTINGS ----------------
+VERSION = "16.6"
 
 SYMBOLS = [
     "ETHUSDT",
@@ -38,98 +31,179 @@ SYMBOLS = [
 ]
 
 CATEGORY = "linear"
-
 LEVERAGE = 8
 MAX_POSITIONS = 3
 MIN_TRADE_NOTIONAL = 60.0
-DAILY_LOSS_LIMIT = 10
-
+DAILY_LOSS_LIMIT = 10.0
 START_BALANCE = 10000.0
 RISK_PER_TRADE = 3.0
 MAX_EQUITY_EXPOSURE = 0.10
 
 SCAN_SECONDS = 30
-ENTRY_SCORE = 60
-
+ENTRY_SCORE = 55
 RSI_INTERVAL = "5"
 TREND_INTERVAL = "15"
-TRADING_INTERVAL = TREND_INTERVAL
 
 STOP_LOSS_PERCENT = 0.014
 TAKE_PROFIT_PERCENT = 0.017
-
 COOLDOWN_SECONDS = 60
-
 FEE_RATE = 0.00055
 PAPER_TRADING = True
-
-VERSION = "16.5"
 MAX_HISTORY = 500
 
-# ---------------- ADAPTIVE LEARNING ----------------
+LEARNING_FEATURES = [
+    "trend_fast",
+    "trend_slow",
+    "rsi",
+    "macd",
+    "volume",
+    "orderbook",
+    "confirmation",
+    "higher_timeframe",
+    "adx",
+    "funding",
+    "open_interest"
+]
 
-LEARNING_ENABLED = True
 LEARNING_MIN_SAMPLES = 10
 LEARNING_WINDOW = 30
 LEARNING_MIN_WEIGHT = 0.75
 LEARNING_MAX_WEIGHT = 1.25
 LEARNING_RATE = 0.15
 
-LEARNING_FEATURES = [
-    "trend_fast", "trend_slow", "rsi", "macd", "volume",
-    "orderbook", "confirmation", "higher_timeframe",
-    "adx", "funding", "open_interest"
-]
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
-DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
-
-# ---------------- STORAGE ----------------
-
-DATA_DIR = os.getenv("DATA_DIR", "/tmp")
+DATA_DIR = os.environ.get("DATA_DIR", "/tmp")
 STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v16.json")
 
-API_KEY = "YOUR_BYBIT_API_KEY"
-API_SECRET = "YOUR_BYBIT_API_SECRET"
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 
-SUPABASE_URL = "YOUR_SUPABASE_URL"
-SUPABASE_KEY = "YOUR_SUPABASE_KEY"
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-API_KEY = os.getenv("BYBIT_API_KEY", API_KEY).strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", API_SECRET).strip()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", SUPABASE_URL).strip().rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", SUPABASE_KEY).strip()
-
-SUPABASE_ENABLED = (
+SUPABASE_ENABLED = bool(
     SUPABASE_URL.startswith("https://")
     and SUPABASE_KEY
-    and SUPABASE_KEY != "YOUR_SUPABASE_KEY"
 )
 
-# ---------------- BYBIT CONNECTION ----------------
+# ============================================================
+# LOGGING
+# ============================================================
 
-public_api = HTTP(testnet=False, timeout=15)
-private_api = None
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-if (
-    API_KEY
-    and API_SECRET
-    and API_KEY != "YOUR_BYBIT_API_KEY"
-    and API_SECRET != "YOUR_BYBIT_API_SECRET"
-):
-    private_api = HTTP(
-        api_key=API_KEY,
-        api_secret=API_SECRET,
-        testnet=False,
-        timeout=15
-    )
+log = logging.getLogger("CoinSentra")
 
-# ---------------- STATE ----------------
+# ============================================================
+# APP
+# ============================================================
+
+app = Flask(__name__)
 
 lock = threading.RLock()
-storage_lock = threading.Lock()
 worker_lock = threading.Lock()
 worker_started = False
+
+# ============================================================
+# BYBIT
+# ============================================================
+
+public_api = HTTP(
+    testnet=False,
+    timeout=15
+)
+
+private_api = None
+
+if BYBIT_API_KEY and BYBIT_API_SECRET:
+    try:
+        private_api = HTTP(
+            testnet=False,
+            api_key=BYBIT_API_KEY,
+            api_secret=BYBIT_API_SECRET,
+            timeout=15
+        )
+    except Exception:
+        log.exception("Private Bybit initialization failed")
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_text():
+    return datetime.now(timezone.utc).isoformat()
+
+def number(value, default=0.0):
+    try:
+        result = float(value)
+        if math.isfinite(result):
+            return result
+    except (TypeError, ValueError):
+        pass
+    return default
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+def check_bybit_result(result):
+    if not isinstance(result, dict):
+        raise RuntimeError("Invalid Bybit response")
+
+    if result.get("retCode", 0) != 0:
+        raise RuntimeError(
+            result.get("retMsg", "Bybit API error")
+        )
+
+    return result
+
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+def http_json(url, method="GET", headers=None, body=None, timeout=15):
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers=headers or {},
+        method=method
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+
+    return json.loads(raw) if raw else {}
+
+# ============================================================
+# LEARNING STATE
+# ============================================================
+
+def default_weights():
+    return {name: 1.0 for name in LEARNING_FEATURES}
+
+def default_learning():
+    return {
+        "enabled": True,
+        "samples": 0,
+        "updates": 0,
+        "last_update": None,
+        "last_result": "Waiting",
+        "processed_ids": [],
+        "weights": default_weights()
+    }
+
+# ============================================================
+# STATE
+# ============================================================
 
 state = {
     "balance": START_BALANCE,
@@ -146,98 +220,66 @@ state = {
     "scan_count": 0,
     "last_closed_by_symbol": {},
     "version": VERSION,
-    "learning": {
-        "enabled": LEARNING_ENABLED,
-        "weights": dict(DEFAULT_WEIGHTS),
-        "samples": 0,
-        "updates": 0,
-        "last_update": None,
-        "last_result": "Waiting for completed trades",
-        "processed_trade_ids": []
-    }
+    "learning": default_learning()
 }
 
 # ============================================================
-# GENERAL HELPERS
+# STATE SNAPSHOT
 # ============================================================
 
-def now_text():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def number(value, default=0.0):
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else default
-    except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def safe_int(value, default=0):
-    try:
-        return int(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def check_bybit_result(result):
-    if not isinstance(result, dict):
-        raise ValueError("Invalid Bybit response")
-
-    code = result.get("retCode", 0)
-
-    if code not in (0, "0", None):
-        raise ValueError(
-            "Bybit error " + str(code) + ": "
-            + str(result.get("retMsg", "Unknown error"))
-        )
-
-    return result
-
+def state_snapshot():
+    with lock:
+        return {
+            "balance": state["balance"],
+            "positions": state["positions"],
+            "history": state["history"][:MAX_HISTORY],
+            "daily_pnl": state["daily_pnl"],
+            "daily_date": state["daily_date"],
+            "running": state["running"],
+            "last_scan": state["last_scan"],
+            "last_error": state["last_error"],
+            "private_status": state["private_status"],
+            "account_balance": state["account_balance"],
+            "symbols": state["symbols"],
+            "scan_count": state["scan_count"],
+            "last_closed_by_symbol": state["last_closed_by_symbol"],
+            "version": VERSION,
+            "learning": state["learning"]
+        }
 
 # ============================================================
-# SUPABASE STORAGE
+# SUPABASE
 # ============================================================
-
-def supabase_headers():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": "Bearer " + SUPABASE_KEY,
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal"
-    }
-
 
 def supabase_save(snapshot):
     if not SUPABASE_ENABLED:
         return False
 
     try:
-        payload = {
+        payload = json.dumps({
             "id": "main",
             "state": snapshot,
             "updated_at": now_text()
-        }
+        }).encode("utf-8")
 
         url = SUPABASE_URL + "/rest/v1/coinsentra_state"
 
+        headers = supabase_headers()
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+
         request = urllib.request.Request(
             url,
-            data=json.dumps(payload, allow_nan=False).encode("utf-8"),
-            headers=supabase_headers(),
+            data=payload,
+            headers=headers,
             method="POST"
         )
 
         with urllib.request.urlopen(request, timeout=20) as response:
-            response.read()
-
-        log.info("SUPABASE STATE SAVED")
-        return True
+            return 200 <= response.status < 300
 
     except Exception:
-        log.exception("SUPABASE SAVE FAILED")
+        log.exception("Supabase state save failed")
         return False
-
 
 def supabase_load():
     if not SUPABASE_ENABLED:
@@ -247,557 +289,288 @@ def supabase_load():
         url = (
             SUPABASE_URL
             + "/rest/v1/coinsentra_state"
-            + "?select=state&id=eq.main&limit=1"
-        )
+            + "?select=state& id=eq.main"
+        ).replace("?select=state& id", "?select=state&id")
 
-        request = urllib.request.Request(
+        result = http_json(
             url,
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": "Bearer " + SUPABASE_KEY,
-                "Accept": "application/json"
-            },
-            method="GET"
+            headers=supabase_headers(),
+            timeout=20
         )
 
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        if isinstance(data, list) and data:
-            saved_state = data[0].get("state")
-
-            if isinstance(saved_state, dict):
-                log.info("SUPABASE STATE RECOVERED")
-                return saved_state
-
-        log.info("NO SUPABASE STATE FOUND")
-        return None
+        if isinstance(result, list) and result:
+            return result[0].get("state")
 
     except Exception:
-        log.exception("SUPABASE LOAD FAILED")
-        return None
+        log.exception("Supabase state load failed")
 
+    return None
 
 # ============================================================
-# TRADE CLEANING AND STORAGE
+# SAVE STATE
+# ============================================================
+
+def save_state():
+    snapshot = state_snapshot()
+
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        temporary = STATE_FILE + ".tmp"
+
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(snapshot, file, ensure_ascii=False)
+
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temporary, STATE_FILE)
+
+    except Exception:
+        log.exception("Local state save failed")
+
+    if SUPABASE_ENABLED:
+        remote_ok = supabase_save(snapshot)
+
+        if not remote_ok:
+            log.error("REMOTE PERSISTENCE FAILED")
+
+        return remote_ok
+
+    log.warning("Supabase not configured; Render local storage is temporary")
+    return True
+
+# ============================================================
+# LOAD STATE
+# ============================================================
+
+def load_state():
+    loaded = None
+
+    if SUPABASE_ENABLED:
+        loaded = supabase_load()
+
+    if loaded is None:
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+        except Exception:
+            loaded = None
+
+    if not isinstance(loaded, dict):
+        log.warning("No recoverable state found; initializing new state")
+        return
+
+    with lock:
+        state["balance"] = number(
+            loaded.get("balance"), START_BALANCE
+        )
+
+        state["positions"] = [
+            p for p in loaded.get("positions", [])
+            if isinstance(p, dict)
+        ]
+
+        state["history"] = [
+            t for t in loaded.get("history", [])
+            if isinstance(t, dict)
+        ][:MAX_HISTORY]
+
+        state["daily_pnl"] = number(loaded.get("daily_pnl"))
+        state["daily_date"] = loaded.get("daily_date", str(date.today()))
+        state["running"] = bool(loaded.get("running", True))
+        state["last_scan"] = loaded.get("last_scan")
+        state["last_error"] = loaded.get("last_error")
+        state["private_status"] = loaded.get("private_status", "NOT CONFIGURED")
+        state["account_balance"] = loaded.get("account_balance")
+        state["symbols"] = loaded.get("symbols", {})
+        state["scan_count"] = int(loaded.get("scan_count", 0))
+        state["last_closed_by_symbol"] = loaded.get(
+            "last_closed_by_symbol", {}
+        )
+        state["version"] = VERSION
+
+        learning = loaded.get("learning", default_learning())
+
+        if not isinstance(learning, dict):
+            learning = default_learning()
+
+        merged_learning = default_learning()
+        merged_learning.update(learning)
+
+        old_weights = learning.get("weights", {})
+        merged_learning["weights"] = default_weights()
+
+        for key in LEARNING_FEATURES:
+            merged_learning["weights"][key] = clamp(
+                number(old_weights.get(key), 1.0),
+                LEARNING_MIN_WEIGHT,
+                LEARNING_MAX_WEIGHT
+            )
+
+        state["learning"] = merged_learning
+
+        # Normalize restored positions
+        for position in state["positions"]:
+            position["entry"] = number(position.get("entry"))
+            position["quantity"] = number(position.get("quantity"))
+            position["margin"] = number(position.get("margin"))
+            position["leverage"] = number(position.get("leverage"), LEVERAGE)
+            position["unrealized_pnl"] = number(position.get("unrealized_pnl"))
+            position["stop_loss"] = number(position.get("stop_loss"))
+            position["take_profit"] = number(position.get("take_profit"))
+
+            # Preserve existing position SL/TP values.
+            if position["entry"] > 0:
+                if position["stop_loss"] <= 0:
+                    position["stop_loss"] = (
+                        position["entry"] * (1 - STOP_LOSS_PERCENT)
+                        if position.get("side") == "LONG"
+                        else position["entry"] * (1 + STOP_LOSS_PERCENT)
+                    )
+
+                if position["take_profit"] <= 0:
+                    position["take_profit"] = (
+                        position["entry"] * (1 + TAKE_PROFIT_PERCENT)
+                        if position.get("side") == "LONG"
+                        else position["entry"] * (1 - TAKE_PROFIT_PERCENT)
+                    )
+
+    log.info(
+        "STATE RECOVERED | Positions %s | History %s | Balance %.2f",
+        len(state["positions"]),
+        len(state["history"]),
+        state["balance"]
+    )
+
+# ============================================================
+# DAILY RESET
+# ============================================================
+
+def reset_daily():
+    today = str(date.today())
+
+    changed = False
+
+    with lock:
+        if state["daily_date"] != today:
+            state["daily_date"] = today
+            state["daily_pnl"] = 0.0
+            changed = True
+
+    if changed:
+        save_state()
+
+# ============================================================
+# LEARNING WEIGHTS
+# ============================================================
+
+def get_learning_weights():
+    with lock:
+        return dict(state["learning"]["weights"])
+
+def learning_snapshot_for_side(features, side):
+    direction = 1 if side == "LONG" else -1
+
+    snapshot = {}
+
+    for name in LEARNING_FEATURES:
+        snapshot[name] = number(features.get(name)) * direction
+
+    return snapshot
+
+# ============================================================
+# TRADE NORMALIZATION
 # ============================================================
 
 def clean_trade(trade):
     if not isinstance(trade, dict):
         return None
 
-    if trade.get("exit") is None or trade.get("pnl") is None:
+    if trade.get("status") != "COMPLETED":
+        return None
+
+    required = ["entry", "exit", "quantity", "pnl"]
+
+    for key in required:
+        if key not in trade:
+            return None
+
+    entry = number(trade.get("entry"))
+    exit_price = number(trade.get("exit"))
+    quantity = number(trade.get("quantity"))
+
+    if entry <= 0 or exit_price <= 0 or quantity <= 0:
         return None
 
     result = dict(trade)
 
-    if not result.get("trade_id"):
-        identity = {
-            "symbol": result.get("symbol", ""),
-            "side": result.get("side", ""),
-            "opened": result.get("opened", ""),
-            "closed": result.get("closed", ""),
-            "entry": result.get("entry", 0),
-            "exit": result.get("exit", 0),
-            "quantity": result.get("quantity", 0)
-        }
+    result["entry"] = entry
+    result["exit"] = exit_price
+    result["quantity"] = quantity
+    result["pnl"] = number(trade.get("pnl"))
+    result["net_pnl"] = number(trade.get("net_pnl"), result["pnl"])
+    result["gross_pnl"] = number(trade.get("gross_pnl"))
+    result["fees"] = number(trade.get("fees"))
+    result["trade_id"] = str(trade.get("trade_id") or uuid.uuid4().hex)
 
-        fingerprint = json.dumps(
-            identity,
-            sort_keys=True,
-            default=str
-        )
-
-        result["trade_id"] = (
-            "OLD-" + hashlib.sha256(
-                fingerprint.encode("utf-8")
-            ).hexdigest()[:16]
-        )
-
-    result.setdefault("status", "COMPLETED")
-    result.setdefault("fees", 0.0)
-    result.setdefault("gross_pnl", result.get("pnl", 0))
-    result.setdefault("net_pnl", result.get("pnl", 0))
-    result.setdefault("reason", "CLOSED")
-    result.setdefault("opened", "")
-    result.setdefault("closed", "")
-    result.setdefault("feature_snapshot", {})
-
-    result["entry"] = number(result.get("entry"))
-    result["exit"] = number(result.get("exit"))
-    result["quantity"] = number(result.get("quantity"))
-    result["gross_pnl"] = number(result.get("gross_pnl"))
-    result["fees"] = number(result.get("fees"))
-    result["pnl"] = number(result.get("pnl"))
-    result["net_pnl"] = number(result.get("net_pnl"))
     result["status"] = "COMPLETED"
 
-    if not isinstance(result["feature_snapshot"], dict):
-        result["feature_snapshot"] = {}
-
-    if (
-        result["entry"] <= 0
-        or result["exit"] <= 0
-        or result["quantity"] <= 0
-    ):
-        return None
-
     return result
-
-
-def save_state():
-    try:
-        with storage_lock:
-            os.makedirs(DATA_DIR, exist_ok=True)
-
-            with lock:
-                snapshot = json.loads(
-                    json.dumps(state, allow_nan=False)
-                )
-
-            temp_file = STATE_FILE + "." + uuid.uuid4().hex + ".tmp"
-
-            try:
-                with open(temp_file, "w", encoding="utf-8") as f:
-                    json.dump(
-                        snapshot,
-                        f,
-                        indent=2,
-                        allow_nan=False
-                    )
-                    f.flush()
-                    os.fsync(f.fileno())
-
-                os.replace(temp_file, STATE_FILE)
-
-            finally:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-
-            if SUPABASE_ENABLED:
-                supabase_save(snapshot)
-
-        log.info(
-            "STATE SAVED | positions=%s | history=%s",
-            len(snapshot.get("positions", [])),
-            len(snapshot.get("history", []))
-        )
-
-        return True
-
-    except Exception:
-        log.exception("V16.5 state save failed")
-        return False
-
-
-def load_state():
-    saved = None
-
-    if SUPABASE_ENABLED:
-        saved = supabase_load()
-
-    if saved is None and os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-        except Exception:
-            log.exception("Local state recovery failed")
-
-    if not isinstance(saved, dict):
-        log.info("New V16.5 paper account")
-        return
-
-    try:
-        with lock:
-            for key in (
-                "balance", "positions", "history", "daily_pnl",
-                "daily_date", "running", "last_scan", "last_error",
-                "private_status", "account_balance", "symbols",
-                "scan_count", "last_closed_by_symbol"
-            ):
-                if key in saved:
-                    state[key] = saved[key]
-
-            if not isinstance(state["positions"], list):
-                state["positions"] = []
-
-            if not isinstance(state["history"], list):
-                state["history"] = []
-
-            if not isinstance(state["symbols"], dict):
-                state["symbols"] = {}
-
-            if not isinstance(state["last_closed_by_symbol"], dict):
-                state["last_closed_by_symbol"] = {}
-
-            state["balance"] = number(
-                state.get("balance"), START_BALANCE
-            )
-
-            saved_learning = saved.get("learning", {})
-
-            if not isinstance(saved_learning, dict):
-                saved_learning = {}
-
-            saved_weights = saved_learning.get("weights", {})
-
-            if not isinstance(saved_weights, dict):
-                saved_weights = {}
-
-            weights = dict(DEFAULT_WEIGHTS)
-
-            for name in LEARNING_FEATURES:
-                weights[name] = round(
-                    max(
-                        LEARNING_MIN_WEIGHT,
-                        min(
-                            LEARNING_MAX_WEIGHT,
-                            number(saved_weights.get(name), 1.0)
-                        )
-                    ),
-                    4
-                )
-
-            processed_ids = saved_learning.get(
-                "processed_trade_ids", []
-            )
-
-            if not isinstance(processed_ids, list):
-                processed_ids = []
-
-            state["learning"] = {
-                "enabled": LEARNING_ENABLED,
-                "weights": weights,
-                "samples": max(
-                    0, safe_int(saved_learning.get("samples"))
-                ),
-                "updates": max(
-                    0, safe_int(saved_learning.get("updates"))
-                ),
-                "last_update": saved_learning.get("last_update"),
-                "last_result": saved_learning.get(
-                    "last_result",
-                    "Waiting for completed trades"
-                ),
-                "processed_trade_ids": [
-                    str(x) for x in processed_ids
-                ][-2000:]
-            }
-
-            cleaned_history = []
-            seen_ids = set()
-
-            for item in state["history"]:
-                trade = clean_trade(item)
-
-                if trade is None:
-                    continue
-
-                trade_id = trade["trade_id"]
-
-                if trade_id in seen_ids:
-                    continue
-
-                seen_ids.add(trade_id)
-                cleaned_history.append(trade)
-
-            state["history"] = cleaned_history[:MAX_HISTORY]
-
-            restored_positions = []
-
-            for position in state["positions"]:
-                if not isinstance(position, dict):
-                    continue
-
-                position.setdefault("trade_id", uuid.uuid4().hex)
-                position.setdefault("opened", now_text())
-                position.setdefault(
-                    "current_price",
-                    number(position.get("entry"))
-                )
-                position.setdefault("unrealized_pnl", 0.0)
-                position.setdefault("feature_snapshot", {})
-
-                if not isinstance(position["feature_snapshot"], dict):
-                    position["feature_snapshot"] = {}
-
-                entry = number(position.get("entry"))
-                side = position.get("side")
-
-                if entry > 0 and side in ("LONG", "SHORT"):
-                    stop_distance = entry * STOP_LOSS_PERCENT
-
-                    if side == "LONG":
-                        position["stop_loss"] = entry * (
-                            1 - STOP_LOSS_PERCENT
-                        )
-                        position["take_profit"] = entry * (
-                            1 + TAKE_PROFIT_PERCENT
-                        )
-                    else:
-                        position["stop_loss"] = entry * (
-                            1 + STOP_LOSS_PERCENT
-                        )
-                        position["take_profit"] = entry * (
-                            1 - TAKE_PROFIT_PERCENT
-                        )
-
-                    position["stop_distance"] = stop_distance
-                    position["reward_risk"] = (
-                        TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT
-                    )
-
-                if (
-                    entry <= 0
-                    or number(position.get("quantity")) <= 0
-                    or number(position.get("stop_loss")) <= 0
-                    or number(position.get("take_profit")) <= 0
-                ):
-                    position["state_error"] = (
-                        "Invalid saved position values - preserved"
-                    )
-                else:
-                    position.pop("state_error", None)
-
-                restored_positions.append(position)
-
-            state["positions"] = restored_positions
-            state["version"] = VERSION
-
-        log.info(
-            "V16.5 RESTORED | positions=%s | completed=%s",
-            len(state["positions"]),
-            len(state["history"])
-        )
-
-        save_state()
-
-    except Exception:
-        log.exception("V16.5 state loading failed")
-
-
-def reset_daily():
-    today = str(date.today())
-
-    with lock:
-        if state["daily_date"] != today:
-            state["daily_date"] = today
-            state["daily_pnl"] = 0.0
-
-    save_state()
-
 
 # ============================================================
 # ADAPTIVE LEARNING
 # ============================================================
 
-def learning_snapshot_for_side(features, side):
-    if not isinstance(features, dict):
-        return {}
-
-    direction = 1 if side == "LONG" else -1
-    result = {}
-
-    for name in LEARNING_FEATURES:
-        value = number(features.get(name))
-        result[name] = max(-1.0, min(1.0, value * direction))
-
-    return result
-
-
 def update_learning(trade):
-    if not LEARNING_ENABLED or not isinstance(trade, dict):
-        return
-
     trade = clean_trade(trade)
 
     if trade is None:
         return
 
-    features = trade.get("feature_snapshot")
-
-    if not isinstance(features, dict) or not features:
-        log.warning(
-            "LEARNING SKIPPED: missing features | %s",
-            trade.get("trade_id")
-        )
-        return
-
-    trade_id = str(trade.get("trade_id", ""))
-    pnl = number(trade.get("pnl"))
-
-    if not trade_id or pnl == 0:
-        return
+    trade_id = trade["trade_id"]
 
     with lock:
         learning = state["learning"]
-        processed = learning.get("processed_trade_ids", [])
 
-        if not isinstance(processed, list):
-            processed = []
-
-        if trade_id in processed:
+        if trade_id in learning["processed_ids"]:
             return
 
-        processed.append(trade_id)
-        learning["processed_trade_ids"] = processed[-2000:]
+        learning["processed_ids"].append(trade_id)
+        learning["processed_ids"] = learning["processed_ids"][-1000:]
 
-        learning["samples"] = safe_int(
-            learning.get("samples")
-        ) + 1
+        snapshot = trade.get("feature_snapshot", {})
+        outcome = 1 if trade["pnl"] > 0 else -1
 
-        chronological = [
-            clean_trade(item)
-            for item in reversed(state["history"])
-        ]
+        for name in LEARNING_FEATURES:
+            value = number(snapshot.get(name))
 
-        chronological = [
-            item for item in chronological
-            if item is not None
-        ]
-
-        current_index = next(
-            (
-                i for i, item in enumerate(chronological)
-                if item.get("trade_id") == trade_id
-            ),
-            None
-        )
-
-        if current_index is None:
-            chronological.append(trade)
-            current_index = len(chronological) - 1
-
-        eligible = []
-
-        for item in chronological[:current_index + 1]:
-            snapshot = item.get("feature_snapshot", {})
-            item_pnl = number(item.get("pnl"))
-
-            if (
-                isinstance(snapshot, dict)
-                and snapshot
-                and item_pnl != 0
-            ):
-                eligible.append({
-                    "features": snapshot,
-                    "outcome": 1.0 if item_pnl > 0 else -1.0
-                })
-
-        eligible = eligible[-LEARNING_WINDOW:]
-
-        if len(eligible) < LEARNING_MIN_SAMPLES:
-            learning["last_result"] = (
-                "WIN - collecting samples"
-                if pnl > 0
-                else "LOSS - collecting samples"
-            )
-
-        else:
-            weights = dict(learning["weights"])
-
-            for name in LEARNING_FEATURES:
-                values = []
-
-                for sample in eligible:
-                    feature_value = number(
-                        sample["features"].get(name)
-                    )
-
-                    values.append(
-                        feature_value * sample["outcome"]
-                    )
-
-                correlation = (
-                    sum(values) / len(values)
-                    if values else 0.0
-                )
-
-                new_weight = (
-                    number(weights.get(name), 1.0)
-                    + correlation * LEARNING_RATE
-                )
-
-                weights[name] = round(
-                    max(
-                        LEARNING_MIN_WEIGHT,
-                        min(LEARNING_MAX_WEIGHT, new_weight)
-                    ),
-                    4
-                )
-
-            learning["weights"] = weights
-
-            learning["updates"] = safe_int(
-                learning.get("updates")
-            ) + 1
-
-            learning["last_result"] = (
-                "WIN - weights updated"
-                if pnl > 0
-                else "LOSS - weights updated"
-            )
-
-        learning["last_update"] = now_text()
-
-    if not save_state():
-        log.error("LEARNING SAVE FAILED | trade=%s", trade_id)
-
-
-def recover_learning():
-    if not LEARNING_ENABLED:
-        return
-
-    with lock:
-        completed = [
-            clean_trade(item)
-            for item in reversed(state["history"])
-        ]
-
-    completed = [
-        item for item in completed
-        if item is not None
-    ]
-
-    recovered = 0
-
-    for trade in completed:
-        with lock:
-            processed = state["learning"].get(
-                "processed_trade_ids", []
-            )
-
-            if trade["trade_id"] in processed:
+            if value == 0:
                 continue
 
-        try:
-            update_learning(trade)
+            adjustment = LEARNING_RATE * outcome * value
 
-            with lock:
-                processed_now = state["learning"].get(
-                    "processed_trade_ids", []
-                )
-
-            if trade["trade_id"] in processed_now:
-                recovered += 1
-
-        except Exception:
-            log.exception(
-                "LEARNING RECOVERY FAILED | %s",
-                trade.get("trade_id")
+            learning["weights"][name] = clamp(
+                learning["weights"][name] + adjustment,
+                LEARNING_MIN_WEIGHT,
+                LEARNING_MAX_WEIGHT
             )
 
-    if recovered:
-        log.info(
-            "LEARNING RECOVERY COMPLETE | processed=%s",
-            recovered
+        learning["samples"] += 1
+        learning["updates"] += 1
+        learning["last_update"] = now_text()
+        learning["last_result"] = (
+            "WIN" if trade["pnl"] > 0 else "LOSS"
         )
 
+    save_state()
 
-def get_learning_weights():
+def recover_learning():
     with lock:
-        return dict(state["learning"]["weights"])
+        trades = list(state["history"])
 
+    for trade in reversed(trades):
+        update_learning(trade)
 
 # ============================================================
 # MARKET DATA
@@ -811,20 +584,19 @@ def get_price(symbol):
         )
     )
 
-    rows = result.get("result", {}).get("list", [])
+    data = result.get("result", {}).get("list", [])
 
-    if not rows:
-        raise ValueError("No ticker data: " + symbol)
+    if not data:
+        raise RuntimeError("No ticker returned")
 
-    price = number(rows[0].get("lastPrice"))
+    price = number(data[0].get("lastPrice"))
 
     if price <= 0:
-        raise ValueError("Invalid ticker price: " + symbol)
+        raise RuntimeError("Invalid price")
 
     return price
 
-
-def get_candles(symbol, interval="15", limit=200):
+def get_candles(symbol, interval, limit=200):
     result = check_bybit_result(
         public_api.get_kline(
             category=CATEGORY,
@@ -834,83 +606,80 @@ def get_candles(symbol, interval="15", limit=200):
         )
     )
 
-    rows = result.get("result", {}).get("list", [])
-
-    if not rows:
-        raise ValueError("No candle data: " + symbol)
+    raw = result.get("result", {}).get("list", [])
 
     candles = []
 
-    for row in reversed(rows):
-        if len(row) < 7:
+    for row in reversed(raw):
+        if len(row) < 6:
             continue
 
-        candles.append({
-            "time": safe_int(row[0]),
+        candle = {
+            "time": int(row[0]),
             "open": number(row[1]),
             "high": number(row[2]),
             "low": number(row[3]),
             "close": number(row[4]),
-            "volume": number(row[5]),
-            "turnover": number(row[6])
-        })
+            "volume": number(row[5])
+        }
+
+        if all(
+            candle[k] > 0
+            for k in ("open", "high", "low", "close")
+        ):
+            candles.append(candle)
 
     if len(candles) < 60:
-        raise ValueError("Insufficient candle history: " + symbol)
+        raise RuntimeError("Insufficient candles")
 
-    # Exclude the currently forming candle.
-    candles = candles[:-1]
-
-    if len(candles) < 55:
-        raise ValueError("Not enough completed candles: " + symbol)
-
-    return candles
-
+    return candles[:-1]
 
 def get_orderbook(symbol):
-    result = check_bybit_result(
-        public_api.get_orderbook(
-            category=CATEGORY,
-            symbol=symbol,
-            limit=25
+    try:
+        result = check_bybit_result(
+            public_api.get_orderbook(
+                category=CATEGORY,
+                symbol=symbol,
+                limit=50
+            )
         )
-    )
 
-    data = result.get("result", {})
-    bids = data.get("b", [])
-    asks = data.get("a", [])
+        book = result.get("result", {})
+        bids = book.get("b", [])
+        asks = book.get("a", [])
 
-    bid_volume = sum(number(x[1]) for x in bids if len(x) > 1)
-    ask_volume = sum(number(x[1]) for x in asks if len(x) > 1)
+        bid_volume = sum(number(x[1]) for x in bids)
+        ask_volume = sum(number(x[1]) for x in asks)
 
-    total = bid_volume + ask_volume
+        total = bid_volume + ask_volume
 
-    if total <= 0:
+        if total <= 0:
+            return 0.0
+
+        return (bid_volume - ask_volume) / total
+
+    except Exception:
+        log.exception("Orderbook error for %s", symbol)
         return 0.0
-
-    return (bid_volume - ask_volume) / total
-
 
 def get_funding(symbol):
     try:
         result = check_bybit_result(
-            public_api.get_funding_rate_history(
+            public_api.get_tickers(
                 category=CATEGORY,
-                symbol=symbol,
-                limit=1
+                symbol=symbol
             )
         )
 
-        rows = result.get("result", {}).get("list", [])
+        data = result.get("result", {}).get("list", [])
 
-        if rows:
-            return number(rows[0].get("fundingRate"))
+        if data:
+            return number(data[0].get("fundingRate"))
 
-    except Exception as e:
-        log.warning("Funding error %s: %s", symbol, e)
+    except Exception:
+        log.exception("Funding error")
 
     return 0.0
-
 
 def get_open_interest(symbol):
     try:
@@ -919,109 +688,91 @@ def get_open_interest(symbol):
                 category=CATEGORY,
                 symbol=symbol,
                 intervalTime="5min",
-                limit=2
+                limit=6
             )
         )
 
-        rows = result.get("result", {}).get("list", [])
+        values = [
+            number(x.get("openInterest"))
+            for x in result.get("result", {}).get("list", [])
+        ]
 
-        if len(rows) >= 2:
-            older = number(rows[1].get("openInterest"))
-            newer = number(rows[0].get("openInterest"))
+        if len(values) >= 2 and values[-2] > 0:
+            return (values[-1] - values[-2]) / values[-2] * 100
 
-            if older > 0:
-                return (newer - older) / older * 100
-
-    except Exception as e:
-        log.warning("OI error %s: %s", symbol, e)
+    except Exception:
+        log.exception("Open interest error")
 
     return 0.0
-
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
 def ema(values, period):
-    if len(values) < period:
-        return None
+    if not values:
+        return 0.0
 
-    multiplier = 2 / (period + 1)
-    result = sum(values[:period]) / period
+    k = 2 / (period + 1)
+    result = values[0]
 
-    for value in values[period:]:
-        result = value * multiplier + result * (1 - multiplier)
+    for value in values[1:]:
+        result = value * k + result * (1 - k)
 
     return result
-
 
 def rsi(values, period=14):
     if len(values) < period + 1:
         return 50.0
 
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
+    gains = []
+    losses = []
 
-    gains = [max(x, 0) for x in changes]
-    losses = [max(-x, 0) for x in changes]
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
 
-    for i in range(period, len(changes)):
-        avg_gain = (
-            avg_gain * (period - 1) + gains[i]
-        ) / period
-
-        avg_loss = (
-            avg_loss * (period - 1) + losses[i]
-        ) / period
-
-    if avg_loss == 0:
-        return 100.0
+    if avg_loss <= 0:
+        return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
+    return 100 - 100 / (1 + rs)
 
 def macd(values):
-    fast = ema(values, 12)
-    slow = ema(values, 26)
-
-    if fast is None or slow is None:
+    if len(values) < 26:
         return 0.0
 
-    return fast - slow
+    return ema(values, 12) - ema(values, 26)
 
+def bollinger(values, period=20, multiplier=2):
+    subset = values[-period:]
 
-def bollinger(values, period=20):
-    sample = values[-period:]
-
-    if len(sample) < period:
+    if not subset:
         return 0.0, 0.0, 0.0
 
-    middle = sum(sample) / period
+    middle = sum(subset) / len(subset)
 
     variance = sum(
-        (x - middle) ** 2 for x in sample
-    ) / period
+        (x - middle) ** 2 for x in subset
+    ) / len(subset)
 
-    deviation = math.sqrt(max(0.0, variance))
+    deviation = math.sqrt(variance)
 
     return (
-        middle + 2 * deviation,
+        middle + multiplier * deviation,
         middle,
-        middle - 2 * deviation
+        middle - multiplier * deviation
     )
-
 
 def atr(candles, period=14):
     if len(candles) < period + 1:
         return 0.0
 
-    true_ranges = []
+    ranges = []
 
     for i in range(1, len(candles)):
         current = candles[i]
@@ -1033,27 +784,32 @@ def atr(candles, period=14):
             abs(current["low"] - previous["close"])
         )
 
-        true_ranges.append(tr)
+        ranges.append(tr)
 
-    sample = true_ranges[-period:]
-
-    if not sample:
-        return 0.0
-
-    return sum(sample) / len(sample)
-
+    return sum(ranges[-period:]) / period
 
 def adx_approx(candles, period=14):
     if len(candles) < period + 2:
         return 0.0
 
-    tr_values = []
     plus_values = []
     minus_values = []
+    tr_values = []
 
     for i in range(1, len(candles)):
         current = candles[i]
         previous = candles[i - 1]
+
+        up_move = current["high"] - previous["high"]
+        down_move = previous["low"] - current["low"]
+
+        plus_values.append(
+            up_move if up_move > down_move and up_move > 0 else 0
+        )
+
+        minus_values.append(
+            down_move if down_move > up_move and down_move > 0 else 0
+        )
 
         tr = max(
             current["high"] - current["low"],
@@ -1061,31 +817,15 @@ def adx_approx(candles, period=14):
             abs(current["low"] - previous["close"])
         )
 
-        up = current["high"] - previous["high"]
-        down = previous["low"] - current["low"]
-
         tr_values.append(tr)
-        plus_values.append(
-            up if up > down and up > 0 else 0
-        )
-        minus_values.append(
-            down if down > up and down > 0 else 0
-        )
 
     tr_avg = sum(tr_values[-period:]) / period
 
     if tr_avg <= 0:
         return 0.0
 
-    plus_di = (
-        sum(plus_values[-period:]) / period
-        / tr_avg * 100
-    )
-
-    minus_di = (
-        sum(minus_values[-period:]) / period
-        / tr_avg * 100
-    )
+    plus_di = sum(plus_values[-period:]) / period / tr_avg * 100
+    minus_di = sum(minus_values[-period:]) / period / tr_avg * 100
 
     total = plus_di + minus_di
 
@@ -1094,13 +834,12 @@ def adx_approx(candles, period=14):
 
     return abs(plus_di - minus_di) / total * 100
 
-
 def analyze_candles(candles):
     closes = [x["close"] for x in candles]
     volumes = [x["volume"] for x in candles]
 
     if len(closes) < 60:
-        raise ValueError("Insufficient candles for indicators")
+        raise ValueError("Insufficient candles")
 
     e9 = ema(closes, 9)
     e21 = ema(closes, 21)
@@ -1109,11 +848,7 @@ def analyze_candles(candles):
     upper, middle, lower = bollinger(closes)
 
     previous_volumes = volumes[-21:-1]
-
-    average_volume = (
-        sum(previous_volumes) / len(previous_volumes)
-        if previous_volumes else 0.0
-    )
+    average_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0
 
     volume_ratio = (
         volumes[-1] / average_volume
@@ -1136,7 +871,7 @@ def analyze_candles(candles):
     }
 
 # ============================================================
-# 5-MIN RSI + 15-MIN TREND SIGNAL ENGINE
+# SIGNAL ENGINE - SLIGHTLY EASIER ENTRIES
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
@@ -1145,15 +880,11 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     long_score = 0.0
     short_score = 0.0
 
-    features = {
-        name: 0.0 for name in LEARNING_FEATURES
-    }
+    features = {name: 0.0 for name in LEARNING_FEATURES}
 
-    # TREND INDICATORS FROM 15-MINUTE CANDLES
     if fifteen["ema9"] > fifteen["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
-
     elif fifteen["ema9"] < fifteen["ema21"]:
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
@@ -1161,65 +892,53 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if fifteen["ema21"] > fifteen["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
-
     elif fifteen["ema21"] < fifteen["ema50"]:
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
-    # RSI CONFIRMATION FROM 5-MINUTE CANDLES ONLY
-    if 50 <= five["rsi"] <= 68:
+    # Easier RSI range
+    if 48 <= five["rsi"] <= 70:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
-
-    elif 32 <= five["rsi"] <= 50:
+    elif 30 <= five["rsi"] <= 52:
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
-    # MACD FROM 15-MINUTE CANDLES
     if fifteen["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
-
     elif fifteen["macd"] < 0:
         features["macd"] = -1
         short_score += 8 * weights["macd"]
 
-    # VOLUME FROM 15-MINUTE CANDLES
-    if fifteen["volume_ratio"] >= 1.15:
+    if fifteen["volume_ratio"] >= 1.0:
         if fifteen["ema9"] > fifteen["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
-
         elif fifteen["ema9"] < fifteen["ema21"]:
             features["volume"] = -1
             short_score += 8 * weights["volume"]
 
-    # ORDERBOOK
-    if imbalance > 0.15:
+    if imbalance > 0.10:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
-
-    elif imbalance < -0.15:
+    elif imbalance < -0.10:
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
-    # 15-MINUTE TREND CONFIRMATION
     if fifteen["ema9"] > fifteen["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
-
     elif fifteen["ema9"] < fifteen["ema21"]:
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    # 15-MINUTE HIGHER-TIMEFRAME TREND STRENGTH
     if (
         fifteen["ema9"] > fifteen["ema21"]
         and fifteen["ema21"] > fifteen["ema50"]
     ):
         features["higher_timeframe"] = 1
         long_score += 20 * weights["higher_timeframe"]
-
     elif (
         fifteen["ema9"] < fifteen["ema21"]
         and fifteen["ema21"] < fifteen["ema50"]
@@ -1227,11 +946,11 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
-    if fifteen["adx"] >= 18:
+    # Slightly easier trend strength
+    if fifteen["adx"] >= 16:
         if fifteen["ema9"] > fifteen["ema21"]:
             features["adx"] = 1
             long_score += 6 * weights["adx"]
-
         elif fifteen["ema9"] < fifteen["ema21"]:
             features["adx"] = -1
             short_score += 6 * weights["adx"]
@@ -1239,7 +958,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     if funding > 0.0005:
         features["funding"] = -1
         short_score += 2 * weights["funding"]
-
     elif funding < -0.0005:
         features["funding"] = 1
         long_score += 2 * weights["funding"]
@@ -1248,7 +966,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         if fifteen["ema9"] > fifteen["ema21"]:
             features["open_interest"] = 1
             long_score += 2 * weights["open_interest"]
-
         elif fifteen["ema9"] < fifteen["ema21"]:
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
@@ -1258,29 +975,27 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
 
     signal = "WAIT"
 
-    # BOTH CONFIRMATIONS ARE REQUIRED:
-    # 5-MIN RSI + 15-MIN TREND
     long_confirmed = (
-        five["rsi"] >= 50
-        and five["rsi"] <= 68
+        five["rsi"] >= 48
+        and five["rsi"] <= 70
         and fifteen["ema9"] > fifteen["ema21"]
         and fifteen["ema21"] > fifteen["ema50"]
-        and fifteen["adx"] >= 18
-        and fifteen["volume_ratio"] >= 1.15
+        and fifteen["adx"] >= 16
+        and fifteen["volume_ratio"] >= 1.0
     )
 
     short_confirmed = (
-        five["rsi"] >= 32
-        and five["rsi"] <= 50
+        five["rsi"] >= 30
+        and five["rsi"] <= 52
         and fifteen["ema9"] < fifteen["ema21"]
         and fifteen["ema21"] < fifteen["ema50"]
-        and fifteen["adx"] >= 18
-        and fifteen["volume_ratio"] >= 1.15
+        and fifteen["adx"] >= 16
+        and fifteen["volume_ratio"] >= 1.0
     )
 
     if (
         long_score >= ENTRY_SCORE
-        and long_score - short_score >= 15
+        and long_score - short_score >= 12
         and long_confirmed
         and fifteen["price"] > fifteen["ema21"]
     ):
@@ -1288,7 +1003,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
 
     elif (
         short_score >= ENTRY_SCORE
-        and short_score - long_score >= 15
+        and short_score - long_score >= 12
         and short_confirmed
         and fifteen["price"] < fifteen["ema21"]
     ):
@@ -1301,7 +1016,6 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         "features": features
     }
 
-
 # ============================================================
 # ACCOUNTING
 # ============================================================
@@ -1310,39 +1024,23 @@ def position_gross_pnl(position, price):
     entry = number(position.get("entry"))
     quantity = number(position.get("quantity"))
     direction = 1 if position.get("side") == "LONG" else -1
-
     return (price - entry) * quantity * direction
-
 
 def position_fees(position, price):
     entry = number(position.get("entry"))
     quantity = number(position.get("quantity"))
-
-    return (
-        entry * quantity * FEE_RATE
-        + price * quantity * FEE_RATE
-    )
-
+    return entry * quantity * FEE_RATE + price * quantity * FEE_RATE
 
 def position_net_pnl(position, price):
-    return (
-        position_gross_pnl(position, price)
-        - position_fees(position, price)
-    )
-
+    return position_gross_pnl(position, price) - position_fees(position, price)
 
 def account_totals():
     with lock:
         balance = number(state["balance"])
         positions = [dict(p) for p in state["positions"]]
 
-    unrealized = sum(
-        number(p.get("unrealized_pnl")) for p in positions
-    )
-
-    used_margin = sum(
-        number(p.get("margin")) for p in positions
-    )
+    unrealized = sum(number(p.get("unrealized_pnl")) for p in positions)
+    used_margin = sum(number(p.get("margin")) for p in positions)
 
     return {
         "balance": round(balance, 4),
@@ -1352,36 +1050,25 @@ def account_totals():
         "available_balance": round(balance - used_margin, 4)
     }
 
-
 # ============================================================
 # COOLDOWN
 # ============================================================
 
 def symbol_in_cooldown(symbol):
     with lock:
-        closed_at = number(
-            state["last_closed_by_symbol"].get(symbol)
-        )
+        closed_at = number(state["last_closed_by_symbol"].get(symbol))
 
-    if closed_at <= 0:
-        return False
-
-    return time.time() - closed_at < COOLDOWN_SECONDS
-
+    return closed_at > 0 and time.time() - closed_at < COOLDOWN_SECONDS
 
 # ============================================================
 # OPEN PAPER POSITION
 # ============================================================
 
 def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
-    if not PAPER_TRADING or side not in ("LONG", "SHORT"):
-        return False
-
-    if price <= 0:
+    if not PAPER_TRADING or side not in ("LONG", "SHORT") or price <= 0:
         return False
 
     if symbol_in_cooldown(symbol):
-        log.info("COOLDOWN ACTIVE | %s", symbol)
         return False
 
     with lock:
@@ -1391,10 +1078,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if len(state["positions"]) >= MAX_POSITIONS:
             return False
 
-        if any(
-            p.get("symbol") == symbol
-            for p in state["positions"]
-        ):
+        if any(p.get("symbol") == symbol for p in state["positions"]):
             return False
 
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
@@ -1406,52 +1090,28 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if balance <= 0:
             return False
 
-        used_margin = sum(
-            number(p.get("margin"))
-            for p in state["positions"]
-        )
-
-        available_balance = max(
-            0.0,
-            balance - used_margin
-        )
+        used_margin = sum(number(p.get("margin")) for p in state["positions"])
+        available_balance = max(0.0, balance - used_margin)
 
         if available_balance <= 0:
-            log.info("NO AVAILABLE PAPER BALANCE | %s", symbol)
             return False
 
         stop_distance = price * STOP_LOSS_PERCENT
 
-        risk_amount = min(
-            RISK_PER_TRADE,
-            balance * 0.005
-        )
+        risk_amount = min(RISK_PER_TRADE, balance * 0.005)
 
         quantity = risk_amount / stop_distance
-
         minimum_quantity = MIN_TRADE_NOTIONAL / price
         quantity = max(quantity, minimum_quantity)
 
         max_notional = balance * MAX_EQUITY_EXPOSURE
         affordable_notional = available_balance * LEVERAGE
-
-        max_notional = min(
-            max_notional,
-            affordable_notional
-        )
+        max_notional = min(max_notional, affordable_notional)
 
         if max_notional < MIN_TRADE_NOTIONAL:
-            log.info(
-                "INSUFFICIENT AVAILABLE BALANCE | %s | Available %.2f",
-                symbol,
-                available_balance
-            )
             return False
 
-        quantity = min(
-            quantity,
-            max_notional / price
-        )
+        quantity = min(quantity, max_notional / price)
 
         if quantity <= 0:
             return False
@@ -1459,22 +1119,11 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         notional = quantity * price
 
         if notional < MIN_TRADE_NOTIONAL:
-            log.info(
-                "POSITION BELOW $60 MINIMUM | %s | %.2f",
-                symbol,
-                notional
-            )
             return False
 
         margin = notional / LEVERAGE
 
         if margin > available_balance:
-            log.info(
-                "INSUFFICIENT PAPER MARGIN | %s | Needed %.2f | Available %.2f",
-                symbol,
-                margin,
-                available_balance
-            )
             return False
 
         if side == "LONG":
@@ -1504,44 +1153,29 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             "gross_unrealized_pnl": 0.0,
             "entry_fee": notional * FEE_RATE,
             "fee_rate": FEE_RATE,
-            "feature_snapshot": learning_snapshot_for_side(
-                features or {}, side
-            )
+            "feature_snapshot": learning_snapshot_for_side(features or {}, side)
         }
 
         state["positions"].append(position)
 
-        log.info(
-            "PAPER BALANCE CHECK | Balance %.2f | Used Margin %.2f | Available %.2f | New Margin %.2f",
-            balance,
-            used_margin,
-            available_balance,
-            margin
-        )
-
     saved = save_state()
 
     if not saved:
-        log.error(
-            "CRITICAL: position save failed after opening %s",
-            position["trade_id"]
-        )
+        with lock:
+            state["positions"] = [
+                p for p in state["positions"]
+                if p.get("trade_id") != position["trade_id"]
+            ]
+
+        log.error("POSITION ROLLED BACK - STATE SAVE FAILED")
         return False
 
     log.info(
-        "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f | TP %.8f | Notional %.2f | Margin %.2f | Risk %.4f",
-        side,
-        symbol,
-        price,
-        stop_price,
-        target_price,
-        notional,
-        margin,
-        position["risk_amount"]
+        "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f | TP %.8f | Notional %.2f | Margin %.2f",
+        side, symbol, price, stop_price, target_price, notional, margin
     )
 
     return True
-
 
 # ============================================================
 # COMPLETED TRADE ENGINE
@@ -1554,18 +1188,11 @@ def close_paper_position(position, price, reason):
     trade_id = position.get("trade_id")
 
     if not trade_id or price <= 0:
-        log.error("CLOSE FAILED: invalid ID or price")
         return False
-
-    trade = None
-    already_completed = False
 
     with lock:
         live = next(
-            (
-                p for p in state["positions"]
-                if p.get("trade_id") == trade_id
-            ),
+            (p for p in state["positions"] if p.get("trade_id") == trade_id),
             None
         )
 
@@ -1576,111 +1203,79 @@ def close_paper_position(position, price, reason):
         quantity = number(live.get("quantity"))
 
         if entry <= 0 or quantity <= 0:
-            live["state_error"] = "Invalid entry or quantity"
-            log.error("CLOSE FAILED: invalid values | %s", trade_id)
             return False
 
         existing = next(
-            (
-                t for t in state["history"]
-                if isinstance(t, dict)
-                and t.get("trade_id") == trade_id
-            ),
+            (t for t in state["history"] if t.get("trade_id") == trade_id),
             None
         )
 
-        if existing is not None:
-            valid_existing = clean_trade(existing)
-
-            if valid_existing is not None:
-                state["positions"].remove(live)
-                already_completed = True
-            else:
-                state["history"] = [
-                    t for t in state["history"]
-                    if not (
-                        isinstance(t, dict)
-                        and t.get("trade_id") == trade_id
-                    )
-                ]
-
-        if not already_completed:
-            gross = position_gross_pnl(live, price)
-            fees = position_fees(live, price)
-            net = gross - fees
-
-            closed = now_text()
-
-            trade = {
-                "trade_id": trade_id,
-                "status": "COMPLETED",
-                "symbol": live.get("symbol", "UNKNOWN"),
-                "side": live.get("side", "UNKNOWN"),
-                "entry": entry,
-                "exit": price,
-                "quantity": quantity,
-                "notional": number(
-                    live.get("notional"), entry * quantity
-                ),
-                "leverage": number(
-                    live.get("leverage"), LEVERAGE
-                ),
-                "margin": number(live.get("margin")),
-                "gross_pnl": round(gross, 6),
-                "fees": round(fees, 6),
-                "pnl": round(net, 6),
-                "net_pnl": round(net, 6),
-                "reason": reason,
-                "opened": live.get("opened", ""),
-                "closed": closed,
-                "feature_snapshot": dict(
-                    live.get("feature_snapshot", {})
-                )
-            }
-
-            state["history"].insert(0, trade)
-            state["history"] = state["history"][:MAX_HISTORY]
-
-            state["balance"] += net
-            state["daily_pnl"] += net
-
-            symbol = live.get("symbol")
-
-            if symbol:
-                state["last_closed_by_symbol"][symbol] = time.time()
-
+        if existing is not None and clean_trade(existing):
             state["positions"].remove(live)
+            save_state()
+            return True
 
-            if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
-                state["running"] = False
+        gross = position_gross_pnl(live, price)
+        fees = position_fees(live, price)
+        net = gross - fees
 
-            log.info(
-                "TRADE COMPLETED | %s | %s | Gross %.4f | Fees %.4f | Net %.4f | ID %s",
-                symbol,
-                reason,
-                gross,
-                fees,
-                net,
-                trade_id
-            )
+        trade = {
+            "trade_id": trade_id,
+            "status": "COMPLETED",
+            "symbol": live.get("symbol", "UNKNOWN"),
+            "side": live.get("side", "UNKNOWN"),
+            "entry": entry,
+            "exit": price,
+            "quantity": quantity,
+            "notional": number(live.get("notional"), entry * quantity),
+            "leverage": number(live.get("leverage"), LEVERAGE),
+            "margin": number(live.get("margin")),
+            "gross_pnl": round(gross, 6),
+            "fees": round(fees, 6),
+            "pnl": round(net, 6),
+            "net_pnl": round(net, 6),
+            "reason": reason,
+            "opened": live.get("opened", ""),
+            "closed": now_text(),
+            "feature_snapshot": dict(live.get("feature_snapshot", {}))
+        }
 
-    if not save_state():
-        log.error(
-            "CRITICAL: completed trade save failed | %s",
-            trade_id
-        )
+        # Save transaction rollback snapshot
+        old_balance = state["balance"]
+        old_daily = state["daily_pnl"]
+        old_history = list(state["history"])
+        old_positions = list(state["positions"])
+        old_running = state["running"]
+
+        state["history"].insert(0, trade)
+        state["history"] = state["history"][:MAX_HISTORY]
+        state["balance"] += net
+        state["daily_pnl"] += net
+        state["last_closed_by_symbol"][live.get("symbol")] = time.time()
+        state["positions"].remove(live)
+
+        if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
+            state["running"] = False
+
+    saved = save_state()
+
+    if not saved:
+        with lock:
+            state["balance"] = old_balance
+            state["daily_pnl"] = old_daily
+            state["history"] = old_history
+            state["positions"] = old_positions
+            state["running"] = old_running
+
+        log.error("TRADE CLOSE ROLLED BACK - SAVE FAILED")
         return False
-
-    if already_completed:
-        return True
 
     try:
         update_learning(trade)
     except Exception:
-        log.exception("Learning update failed | %s", trade_id)
+        log.exception("Learning update failed")
 
     return True
-
 
 # ============================================================
 # POSITION MONITOR
@@ -1698,28 +1293,17 @@ def monitor_positions():
             quantity = number(position.get("quantity"))
             side = position.get("side")
 
-            if (
-                entry <= 0
-                or quantity <= 0
-                or side not in ("LONG", "SHORT")
-            ):
-                log.error(
-                    "MONITOR SKIPPED INVALID POSITION | %s",
-                    position.get("trade_id")
-                )
+            if entry <= 0 or quantity <= 0 or side not in ("LONG", "SHORT"):
                 continue
 
             stop_price = number(position.get("stop_loss"))
             target_price = number(position.get("take_profit"))
 
             if stop_price <= 0 or target_price <= 0:
-                log.error(
-                    "MONITOR SKIPPED: missing SL/TP | %s",
-                    position.get("trade_id")
-                )
                 continue
 
             price = get_price(position["symbol"])
+
             net = position_net_pnl(position, price)
             gross = position_gross_pnl(position, price)
 
@@ -1735,34 +1319,20 @@ def monitor_positions():
 
             if side == "LONG":
                 if price <= stop_price:
-                    close_paper_position(
-                        position, price, "STOP LOSS"
-                    )
+                    close_paper_position(position, price, "STOP LOSS")
                 elif price >= target_price:
-                    close_paper_position(
-                        position, price, "TAKE PROFIT"
-                    )
-
+                    close_paper_position(position, price, "TAKE PROFIT")
             else:
                 if price >= stop_price:
-                    close_paper_position(
-                        position, price, "STOP LOSS"
-                    )
+                    close_paper_position(position, price, "STOP LOSS")
                 elif price <= target_price:
-                    close_paper_position(
-                        position, price, "TAKE PROFIT"
-                    )
+                    close_paper_position(position, price, "TAKE PROFIT")
 
-        except Exception as e:
-            log.exception(
-                "Monitor error for %s: %s",
-                position.get("symbol"),
-                e
-            )
+        except Exception:
+            log.exception("Position monitor failed for %s", position.get("symbol"))
 
     if changed:
         save_state()
-
 
 # ============================================================
 # DAILY RISK
@@ -1771,24 +1341,15 @@ def monitor_positions():
 def risk_check():
     with lock:
         realized = number(state["daily_pnl"])
+        unrealized = sum(number(p.get("unrealized_pnl")) for p in state["positions"])
+        total = realized + unrealized
 
-        unrealized = sum(
-            number(p.get("unrealized_pnl"))
-            for p in state["positions"]
-        )
-
-        total_daily_pnl = realized + unrealized
-
-        if total_daily_pnl <= -DAILY_LOSS_LIMIT:
+        if total <= -DAILY_LOSS_LIMIT:
             state["running"] = False
-            log.warning(
-                "DAILY LOSS LIMIT REACHED | %.4f",
-                total_daily_pnl
-            )
+            log.warning("DAILY LOSS LIMIT REACHED | %.4f", total)
             return False
 
     return True
-
 
 # ============================================================
 # PRIVATE ACCOUNT - READ ONLY
@@ -1812,41 +1373,30 @@ def check_private_account():
         wallet = None
 
         if accounts:
-            coins = accounts[0].get("coin", [])
             wallet = next(
-                (
-                    item for item in coins
-                    if item.get("coin") == "USDT"
-                ),
+                (item for item in accounts[0].get("coin", []) if item.get("coin") == "USDT"),
                 None
             )
 
         with lock:
-            state["account_balance"] = (
-                number(wallet.get("walletBalance"))
-                if wallet else 0.0
-            )
+            state["account_balance"] = number(wallet.get("walletBalance")) if wallet else 0.0
             state["private_status"] = "CONNECTED - READ ONLY"
 
-    except Exception as e:
+    except Exception:
         with lock:
             state["private_status"] = "CONNECTION FAILED"
-
-        log.error("Private account error: %s", e)
+        log.exception("Private account check failed")
 
     save_state()
 
-
 # ============================================================
-# SCANNER - 5M RSI + 15M TREND
+# SCANNER
 # ============================================================
 
 def scan_symbol(symbol):
-    # TRUE 5-MINUTE CANDLES FOR RSI CONFIRMATION
     five_candles = get_candles(symbol, RSI_INTERVAL, 200)
     five = analyze_candles(five_candles)
 
-    # TRUE 15-MINUTE CANDLES FOR TREND CONFIRMATION
     fifteen_candles = get_candles(symbol, TREND_INTERVAL, 200)
     fifteen = analyze_candles(fifteen_candles)
 
@@ -1857,21 +1407,14 @@ def scan_symbol(symbol):
     oi_change = get_open_interest(symbol)
 
     signal = calculate_signal(
-        five,
-        fifteen,
-        fifteen,
-        imbalance,
-        funding,
-        oi_change
+        five, fifteen, fifteen, imbalance, funding, oi_change
     )
 
     trend = (
         "BULLISH"
-        if fifteen["ema9"] > fifteen["ema21"]
-        and fifteen["ema21"] > fifteen["ema50"]
+        if fifteen["ema9"] > fifteen["ema21"] and fifteen["ema21"] > fifteen["ema50"]
         else "BEARISH"
-        if fifteen["ema9"] < fifteen["ema21"]
-        and fifteen["ema21"] < fifteen["ema50"]
+        if fifteen["ema9"] < fifteen["ema21"] and fifteen["ema21"] < fifteen["ema50"]
         else "MIXED"
     )
 
@@ -1893,35 +1436,29 @@ def scan_symbol(symbol):
         "oi_change": round(oi_change, 3),
         "hourly_trend": trend,
         **signal,
-        "updated": now_text()
+        "updated": now_text(),
+        "data_error": None
     }
 
     with lock:
         state["symbols"][symbol] = data
-
-        should_open = (
-            state["running"]
-            and signal["signal"] in ("LONG", "SHORT")
-        )
+        should_open = state["running"] and signal["signal"] in ("LONG", "SHORT")
 
     if should_open:
         open_paper_position(
-            symbol,
-            signal["signal"],
-            fifteen["price"],
-            signal["features"],
-            fifteen["atr"]
+            symbol, signal["signal"], fifteen["price"],
+            signal["features"], fifteen["atr"]
         )
 
     return data
-
 
 # ============================================================
 # BACKGROUND WORKER
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.5 worker started")
+    log.info("CoinSentra V16.6 worker started")
+
     last_private_check = 0.0
 
     while True:
@@ -1935,13 +1472,14 @@ def background_worker():
                 try:
                     scan_symbol(symbol)
 
-                except Exception as e:
+                except Exception as error:
                     log.exception("Scan failed for %s", symbol)
 
                     with lock:
-                        existing = state["symbols"].get(symbol, {})
-                        existing["data_error"] = str(e)[:180]
+                        existing = dict(state["symbols"].get(symbol, {}))
                         existing["symbol"] = symbol
+                        existing["data_error"] = str(error)[:180]
+                        existing["updated"] = existing.get("updated")
                         state["symbols"][symbol] = existing
 
             risk_check()
@@ -1953,11 +1491,11 @@ def background_worker():
 
             save_state()
 
-        except Exception as e:
+        except Exception:
             log.exception("Worker cycle failed")
 
             with lock:
-                state["last_error"] = str(e)[:250]
+                state["last_error"] = "Worker cycle failed"
 
             save_state()
 
@@ -1967,7 +1505,6 @@ def background_worker():
 
         elapsed = time.time() - cycle_start
         time.sleep(max(1, SCAN_SECONDS - elapsed))
-
 
 def start_worker_once():
     global worker_started
@@ -1985,20 +1522,15 @@ def start_worker_once():
         thread.start()
         worker_started = True
 
-
 # ============================================================
-# PERFORMANCE STATISTICS
+# PERFORMANCE
 # ============================================================
 
 def trade_statistics():
     with lock:
-        trades = [
-            dict(t) for t in state["history"]
-            if clean_trade(t) is not None
-        ]
+        trades = [dict(t) for t in state["history"] if clean_trade(t)]
 
     pnls = [number(t.get("pnl")) for t in trades]
-
     wins_list = [p for p in pnls if p > 0]
     losses_list = [p for p in pnls if p < 0]
 
@@ -2012,19 +1544,10 @@ def trade_statistics():
     gross_wins = sum(wins_list)
     gross_losses = abs(sum(losses_list))
 
-    profit_factor = (
-        gross_wins / gross_losses
-        if gross_losses > 0
-        else gross_wins if gross_wins > 0 else 0.0
-    )
+    profit_factor = gross_wins / gross_losses if gross_losses else (gross_wins if gross_wins else 0)
 
-    average_win = (
-        gross_wins / wins if wins else 0.0
-    )
-
-    average_loss = (
-        gross_losses / losses if losses else 0.0
-    )
+    average_win = gross_wins / wins if wins else 0
+    average_loss = gross_losses / losses if losses else 0
 
     chronological = list(reversed(pnls))
     running_equity = START_BALANCE
@@ -2036,10 +1559,7 @@ def trade_statistics():
         peak_equity = max(peak_equity, running_equity)
 
         if peak_equity > 0:
-            drawdown = (
-                (peak_equity - running_equity)
-                / peak_equity * 100
-            )
+            drawdown = (peak_equity - running_equity) / peak_equity * 100
             max_drawdown = max(max_drawdown, drawdown)
 
     return {
@@ -2047,9 +1567,7 @@ def trade_statistics():
         "wins": wins,
         "losses": losses,
         "breakeven": count - wins - losses,
-        "win_rate": round(
-            wins / count * 100, 2
-        ) if count else 0,
+        "win_rate": round(wins / count * 100, 2) if count else 0,
         "history_realized_pnl": round(realized, 4),
         "total_fees": round(fees, 4),
         "profit_factor": round(profit_factor, 3),
@@ -2057,7 +1575,6 @@ def trade_statistics():
         "average_loss": round(average_loss, 4),
         "max_drawdown": round(max_drawdown, 2)
     }
-
 
 def learning_statistics():
     with lock:
@@ -2074,7 +1591,6 @@ def learning_statistics():
             "weights": dict(learning["weights"])
         }
 
-
 # ============================================================
 # DASHBOARD
 # ============================================================
@@ -2085,7 +1601,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.5</title>
+<title>CoinSentra Trading Brain V16.6</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -2098,7 +1614,6 @@ h2{color:#36d9ff;font-size:18px}
 button{padding:13px;border:0;border-radius:8px;font-weight:bold;margin:5px 2px;cursor:pointer}
 .start{background:#16b981;color:white}
 .stop{background:#dc2525;color:white}
-button:active{transform:scale(.98)}
 table{width:100%;border-collapse:collapse;font-size:12px;min-width:650px}
 td,th{padding:9px 6px;border-bottom:1px solid #293a50;text-align:left;white-space:nowrap}
 th{color:#9bb0ce}
@@ -2115,7 +1630,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.5 | BYBIT | PAPER MODE ONLY | 5M RSI + 15M TREND | MAX 3 POSITIONS | $60 MINIMUM</div>
+<div class="small">TRADING BRAIN V16.6 | BYBIT | PAPER MODE ONLY | 5M RSI + 15M TREND | MAX 3 POSITIONS</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2131,7 +1646,7 @@ th{color:#9bb0ce}
 <button class="stop" onclick="control('stop')">END TRADING (C)</button>
 <button class="start" onclick="control('start')">START TRADING (V)</button>
 <p id="control" class="small">Loading...</p>
-<p class="small">Stopping disables new entries. Existing paper positions remain monitored for TP and SL.</p>
+<p class="small">Stopping disables new entries. Existing paper positions remain monitored.</p>
 </div>
 
 <div class="card">
@@ -2142,7 +1657,7 @@ th{color:#9bb0ce}
 <div class="stat"><span class="small">Last result</span><strong id="learnresult">Waiting</strong></div>
 <div class="stat"><span class="small">Learning status</span><strong id="learnstatus">Collecting data</strong></div>
 </div>
-<p class="small" id="learnmessage">Learning uses completed paper trades. It needs at least 10 eligible trades before adjusting weights.</p>
+<p class="small" id="learnmessage">Learning uses completed paper trades.</p>
 <h2>INDICATOR WEIGHTS</h2>
 <div id="weights" class="small">Waiting...</div>
 </div>
@@ -2197,21 +1712,20 @@ th{color:#9bb0ce}
 
 <div class="card">
 <h2>COMPLETED TRADE HISTORY</h2>
-<div class="small">Only closed trades appear here. Open trades are shown above.</div>
+<div class="small">Closed trades only.</div>
 <div class="scroll">
 <table>
 <thead><tr><th>CLOSED</th><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>EXIT</th><th>GROSS PNL</th><th>FEES</th><th>NET PNL</th><th>REASON</th></tr></thead>
-<tbody id="history"><tr><td colspan="9">No completed trades yet.</td></tr></tbody>
+<tbody id="history"></tbody>
 </table>
 </div>
 </div>
 
 <div class="card small">
-Version 16.5 | 5-minute RSI confirmation + 15-minute trend confirmation<br>
-Maximum 3 simultaneous positions | Minimum $60 notional each<br>
-Fixed stop loss 1.4% | Fixed take profit 1.7%<br>
-1-minute re-entry cooldown | Paper trading only<br>
-Fee estimate 0.055% per side<br>
+Version 16.6 | Easier entry scoring<br>
+Maximum 3 positions | Minimum $60 notional<br>
+Stop loss 1.4% | Take profit 1.7%<br>
+60-second cooldown | Paper trading only<br>
 Last scan: <span id="last">Waiting</span><br>
 Last error: <span id="error">None</span>
 </div>
@@ -2221,7 +1735,7 @@ async function control(action){
  const message=document.getElementById('control');
 
  if(action==='stop'){
-  if(!confirm('End trading? New positions stop opening. Existing positions remain monitored.'))return;
+  if(!confirm('End trading? Existing positions remain monitored.'))return;
  }
 
  message.textContent='Sending command...';
@@ -2255,7 +1769,7 @@ function pnlColor(x){return Number(x)>=0?'green':'red';}
 async function update(){
  try{
   let r=await fetch('/api/data',{cache:'no-store'});
-  if(!r.ok)throw new Error('API response error');
+  if(!r.ok)throw new Error('API error');
   let d=await r.json();
 
   document.getElementById('balance').textContent=money(d.balance);
@@ -2266,7 +1780,7 @@ async function update(){
   document.getElementById('count').textContent=d.positions.length+' / 3';
 
   document.getElementById('control').textContent=
-   d.running?'TRADING ACTIVE - NEW ENTRIES ENABLED':'TRADING ENDED - MONITORING OPEN POSITIONS';
+   d.running?'TRADING ACTIVE - NEW ENTRIES ENABLED':'TRADING STOPPED - MONITORING POSITIONS';
 
   document.getElementById('private').textContent=d.private_status;
   document.getElementById('account').textContent=
@@ -2283,23 +1797,20 @@ async function update(){
   document.getElementById('realized').textContent=money(s.history_realized_pnl);
   document.getElementById('fees').textContent=money(s.total_fees);
   document.getElementById('profitfactor').textContent=s.profit_factor;
-  document.getElementById('averages').textContent=
-   money(s.average_win)+' / '+money(s.average_loss);
+  document.getElementById('averages').textContent=money(s.average_win)+' / '+money(s.average_loss);
   document.getElementById('drawdown').textContent=s.max_drawdown+'%';
 
   let learning=d.learning;
 
-  document.getElementById('learnsamples').textContent=
-   learning.samples+'/'+learning.minimum_samples+' minimum';
+  document.getElementById('learnsamples').textContent=learning.samples+'/'+learning.minimum_samples+' minimum';
   document.getElementById('learnupdates').textContent=learning.updates;
   document.getElementById('learnresult').textContent=learning.last_result||'Waiting';
-  document.getElementById('learnstatus').textContent=
-   learning.samples>=learning.minimum_samples?'ADAPTIVE':'COLLECTING';
+  document.getElementById('learnstatus').textContent=learning.samples>=learning.minimum_samples?'ADAPTIVE':'COLLECTING';
 
   document.getElementById('learnmessage').textContent=
    learning.samples>=learning.minimum_samples
-   ?'Weights are adjusted using recent completed paper trades. Last update: '+(learning.last_update||'Not available')
-   :'The engine needs '+Math.max(0,learning.minimum_samples-learning.samples)+' more eligible completed trades before its first adjustment.';
+   ?'Adaptive learning active. Last update: '+(learning.last_update||'N/A')
+   :'Waiting for '+Math.max(0,learning.minimum_samples-learning.samples)+' eligible completed trades.';
 
   let weightRows='';
   for(let [name,value] of Object.entries(learning.weights||{})){
@@ -2331,11 +1842,8 @@ async function update(){
    ${s.data_error?' | ERROR: '+safe(s.data_error):''}</p>`;
   }
 
-  document.getElementById('markets').innerHTML=
-   rows||'<tr><td colspan="6">Waiting for first market scan</td></tr>';
-
-  document.getElementById('indicators').innerHTML=
-   details||'Waiting for market data';
+  document.getElementById('markets').innerHTML=rows||'<tr><td colspan="6">Waiting for market scan</td></tr>';
+  document.getElementById('indicators').innerHTML=details||'Waiting for data';
 
   let positionRows='';
   for(let p of d.positions){
@@ -2347,8 +1855,7 @@ async function update(){
     <td>${price(p.stop_loss)}</td></tr>`;
   }
 
-  document.getElementById('positions').innerHTML=
-   positionRows||'<tr><td colspan="8">No open positions</td></tr>';
+  document.getElementById('positions').innerHTML=positionRows||'<tr><td colspan="8">No open positions</td></tr>';
 
   let historyRows='';
   for(let p of d.history){
@@ -2361,8 +1868,7 @@ async function update(){
     <td>${safe(p.reason)}</td></tr>`;
   }
 
-  document.getElementById('history').innerHTML=
-   historyRows||'<tr><td colspan="9">No completed trades yet.</td></tr>';
+  document.getElementById('history').innerHTML=historyRows||'<tr><td colspan="9">No completed trades yet</td></tr>';
 
  }catch(e){
   document.getElementById('scanner').textContent='CONNECTION ERROR';
@@ -2377,7 +1883,7 @@ setInterval(update,5000);
 """
 
 # ============================================================
-# WEB ROUTES
+# ROUTES
 # ============================================================
 
 @app.route("/")
@@ -2385,17 +1891,14 @@ def home():
     start_worker_once()
     return render_template_string(HTML)
 
-
 @app.route("/health")
 def health():
     start_worker_once()
-
     return jsonify({
         "status": "ok",
         "version": VERSION,
         "paper_trading": True
     })
-
 
 @app.route("/api/status")
 @app.route("/status")
@@ -2416,19 +1919,16 @@ def status():
             "learning": state["learning"]
         })
 
-
 @app.route("/api/data")
 def api_data():
     start_worker_once()
 
     with lock:
         positions = [dict(p) for p in state["positions"]]
-
         history = []
 
         for item in state["history"]:
             trade = clean_trade(item)
-
             if trade:
                 history.append(trade)
 
@@ -2441,13 +1941,8 @@ def api_data():
         account_balance = state["account_balance"]
         last_error = state["last_error"]
 
-    unrealized = sum(
-        number(p.get("unrealized_pnl")) for p in positions
-    )
-
-    used_margin = sum(
-        number(p.get("margin")) for p in positions
-    )
+    unrealized = sum(number(p.get("unrealized_pnl")) for p in positions)
+    used_margin = sum(number(p.get("margin")) for p in positions)
 
     totals = {
         "balance": round(balance, 4),
@@ -2472,24 +1967,19 @@ def api_data():
         "learning": learning_statistics()
     })
 
-
 @app.route("/api/history")
 def api_history():
     with lock:
-        history = []
-
-        for item in state["history"]:
-            trade = clean_trade(item)
-
-            if trade:
-                history.append(trade)
+        history = [
+            trade for item in state["history"]
+            if (trade := clean_trade(item)) is not None
+        ]
 
     return jsonify({
         "count": len(history),
         "history": history[:MAX_HISTORY],
         "stats": trade_statistics()
     })
-
 
 @app.route("/control/stop", methods=["POST"])
 @app.route("/control/end", methods=["POST"])
@@ -2499,18 +1989,10 @@ def stop():
 
     save_state()
 
-    log.warning(
-        "TRADING ENDED BY USER - open positions remain monitored"
-    )
-
     return jsonify({
         "status": "stopped",
-        "message": (
-            "TRADING ENDED: new entries disabled. "
-            "Existing positions are still monitored."
-        )
+        "message": "Trading stopped. Existing positions remain monitored."
     })
-
 
 @app.route("/control/start", methods=["POST"])
 def start():
@@ -2518,23 +2000,17 @@ def start():
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             return jsonify({
                 "status": "blocked",
-                "error": (
-                    "Daily loss limit reached. "
-                    "Trading remains stopped."
-                )
+                "error": "Daily loss limit reached"
             }), 403
 
         state["running"] = True
 
     save_state()
 
-    log.info("TRADING STARTED BY USER")
-
     return jsonify({
         "status": "started",
-        "message": "TRADING STARTED: new paper entries enabled."
+        "message": "Paper trading started"
     })
-
 
 # ============================================================
 # STARTUP
