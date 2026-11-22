@@ -14,13 +14,14 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.7
+# COINSENTRA TRADING BRAIN V16.8
 # BYBIT | RENDER | SUPABASE | PAPER TRADING
 # RELIABLE STATE | FRESH SCANNER | EASIER ENTRIES
 # CANDLESTICK PATTERN RECOGNITION
+# RSI 50 DIRECTION | VOLUME 0.50x ENTRY
 # ============================================================
 
-VERSION = "16.7"
+VERSION = "16.8"
 
 SYMBOLS = [
     "ETHUSDT",
@@ -51,6 +52,11 @@ COOLDOWN_SECONDS = 60
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 MAX_HISTORY = 500
+
+# Easier entry settings
+RSI_BULLISH_LEVEL = 50
+RSI_BEARISH_LEVEL = 50
+MIN_VOLUME_RATIO = 0.50
 
 LEARNING_FEATURES = [
     "trend_fast",
@@ -866,17 +872,6 @@ def candle_parts(candle):
     }
 
 def detect_candlestick_patterns(candles):
-    """
-    Detect patterns using completed candles only.
-
-    Returns:
-        bullish patterns
-        bearish patterns
-        neutral patterns
-        directional score
-        display text
-    """
-
     result = {
         "bullish": [],
         "bearish": [],
@@ -901,15 +896,8 @@ def detect_candlestick_patterns(candles):
     body2 = p2["body"]
     body3 = p3["body"]
 
-    range1 = p1["range"]
-    range2 = p2["range"]
-    range3 = p3["range"]
-
-    # --------------------------
     # BULLISH PATTERNS
-    # --------------------------
 
-    # Bullish engulfing
     if (
         p2["bearish"]
         and p1["bullish"]
@@ -919,7 +907,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bullish"].append("Bullish Engulfing")
 
-    # Hammer
     if (
         p1["lower"] >= body1 * 2
         and p1["upper"] <= body1 * 0.6
@@ -928,7 +915,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bullish"].append("Hammer")
 
-    # Morning star
     if (
         p3["bearish"]
         and p3["body_ratio"] > 0.5
@@ -938,14 +924,12 @@ def detect_candlestick_patterns(candles):
     ):
         result["bullish"].append("Morning Star")
 
-    # Three white soldiers
     if len(candles) >= 4:
         a = candles[-4]
         b = candles[-3]
         c = candles[-2]
         d = candles[-1]
 
-        pa = candle_parts(a)
         pb = candle_parts(b)
         pc = candle_parts(c)
         pd = candle_parts(d)
@@ -954,7 +938,6 @@ def detect_candlestick_patterns(candles):
             pb["bullish"]
             and pc["bullish"]
             and pd["bullish"]
-            and b["close"] > a["close"]
             and c["close"] > b["close"]
             and d["close"] > c["close"]
             and pb["body_ratio"] > 0.45
@@ -963,11 +946,8 @@ def detect_candlestick_patterns(candles):
         ):
             result["bullish"].append("Three White Soldiers")
 
-    # --------------------------
     # BEARISH PATTERNS
-    # --------------------------
 
-    # Bearish engulfing
     if (
         p2["bullish"]
         and p1["bearish"]
@@ -977,7 +957,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bearish"].append("Bearish Engulfing")
 
-    # Shooting star
     if (
         p1["upper"] >= body1 * 2
         and p1["lower"] <= body1 * 0.6
@@ -986,7 +965,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bearish"].append("Shooting Star")
 
-    # Evening star
     if (
         p3["bullish"]
         and p3["body_ratio"] > 0.5
@@ -996,14 +974,12 @@ def detect_candlestick_patterns(candles):
     ):
         result["bearish"].append("Evening Star")
 
-    # Three black crows
     if len(candles) >= 4:
         a = candles[-4]
         b = candles[-3]
         c = candles[-2]
         d = candles[-1]
 
-        pa = candle_parts(a)
         pb = candle_parts(b)
         pc = candle_parts(c)
         pd = candle_parts(d)
@@ -1020,26 +996,20 @@ def detect_candlestick_patterns(candles):
         ):
             result["bearish"].append("Three Black Crows")
 
-    # --------------------------
     # NEUTRAL PATTERNS
-    # --------------------------
 
-    # Doji
     if p1["body_ratio"] <= 0.10:
         result["neutral"].append("Doji")
 
-    # Long lower wick
     if p1["lower_ratio"] >= 0.55:
         result["neutral"].append("Long Lower Wick")
 
-    # Long upper wick
     if p1["upper_ratio"] >= 0.55:
         result["neutral"].append("Long Upper Wick")
 
     bullish_count = len(result["bullish"])
     bearish_count = len(result["bearish"])
 
-    # Pattern score
     result["score"] = (
         bullish_count * CANDLE_PATTERN_SCORE
         - bearish_count * CANDLE_PATTERN_SCORE
@@ -1055,8 +1025,6 @@ def detect_candlestick_patterns(candles):
         result["signal"] = "BULLISH"
     elif result["score"] < 0:
         result["signal"] = "BEARISH"
-    else:
-        result["signal"] = "NEUTRAL"
 
     all_patterns = (
         result["bullish"]
@@ -1147,10 +1115,11 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
-    if 48 <= five["rsi"] <= 70:
+    # 5-minute RSI direction: above 50 bullish, below 50 bearish
+    if 50 < five["rsi"] <= 70:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
-    elif 30 <= five["rsi"] <= 52:
+    elif 30 <= five["rsi"] < 50:
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
@@ -1161,7 +1130,8 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
         features["macd"] = -1
         short_score += 8 * weights["macd"]
 
-    if fifteen["volume_ratio"] >= 1.0:
+    # Volume gate reduced to 0.50x
+    if fifteen["volume_ratio"] >= MIN_VOLUME_RATIO:
         if fifteen["ema9"] > fifteen["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
@@ -1232,22 +1202,24 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
 
     signal = "WAIT"
 
+    # Easier LONG confirmation
     long_confirmed = (
-        five["rsi"] >= 48
+        five["rsi"] > 50
         and five["rsi"] <= 70
         and fifteen["ema9"] > fifteen["ema21"]
         and fifteen["ema21"] > fifteen["ema50"]
         and fifteen["adx"] >= 16
-        and fifteen["volume_ratio"] >= 1.0
+        and fifteen["volume_ratio"] >= MIN_VOLUME_RATIO
     )
 
+    # Easier SHORT confirmation
     short_confirmed = (
-        five["rsi"] >= 30
-        and five["rsi"] <= 52
+        five["rsi"] < 50
+        and five["rsi"] >= 30
         and fifteen["ema9"] < fifteen["ema21"]
         and fifteen["ema21"] < fifteen["ema50"]
         and fifteen["adx"] >= 16
-        and fifteen["volume_ratio"] >= 1.0
+        and fifteen["volume_ratio"] >= MIN_VOLUME_RATIO
     )
 
     if (
@@ -1296,6 +1268,10 @@ def position_fees(position, price):
 
 def position_net_pnl(position, price):
     return position_gross_pnl(position, price) - position_fees(position, price)
+
+# ============================================================
+# ACCOUNT TOTALS
+# ============================================================
 
 def account_totals():
     with lock:
@@ -1664,7 +1640,6 @@ def scan_symbol(symbol):
 
     fifteen["price"] = get_price(symbol)
 
-    # Detect patterns from completed 5-minute candles
     candle_patterns = detect_candlestick_patterns(five_candles)
 
     imbalance = get_orderbook(symbol)
@@ -1731,7 +1706,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.7 worker started")
+    log.info("CoinSentra V16.8 worker started")
 
     last_private_check = 0.0
 
@@ -1875,7 +1850,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.7</title>
+<title>CoinSentra Trading Brain V16.8</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -1905,7 +1880,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.7 | BYBIT | PAPER MODE ONLY | 5M RSI + 15M TREND + CANDLE PATTERNS | MAX 3 POSITIONS</div>
+<div class="small">TRADING BRAIN V16.8 | BYBIT | PAPER MODE ONLY | 5M RSI 50 DIRECTION + 15M TREND + CANDLE PATTERNS | VOLUME 0.50x | MAX 3 POSITIONS</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -1997,7 +1972,9 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.7 | Easier entry scoring + candlestick recognition<br>
+Version 16.8 | Easier entry scoring + candlestick recognition<br>
+5M RSI above 50 bullish, below 50 bearish<br>
+Volume gate 0.50x average volume<br>
 Patterns: Engulfing, Hammer, Shooting Star, Morning/Evening Star, Three Soldiers/Crows, Doji, Wicks<br>
 Maximum 3 positions | Minimum $60 notional<br>
 Stop loss 1.4% | Take profit 1.7%<br>
