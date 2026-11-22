@@ -14,9 +14,10 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V15.2
+# COINSENTRA TRADING BRAIN V15.3
 # BYBIT | RENDER | SUPABASE | PAPER TRADING ONLY
 # 5-MINUTE STRATEGY | FIXED SL/TP | HISTORY RECOVERY
+# 3 POSITIONS | MINIMUM $60 PER TRADE | BALANCE CHECK
 # ============================================================
 
 app = Flask(__name__)
@@ -38,7 +39,8 @@ SYMBOLS = [
 CATEGORY = "linear"
 
 LEVERAGE = 8
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
+MIN_TRADE_NOTIONAL = 60.0
 DAILY_LOSS_LIMIT = 10
 
 START_BALANCE = 10000.0
@@ -60,7 +62,7 @@ COOLDOWN_SECONDS = 600
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "15.2"
+VERSION = "15.3"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -392,7 +394,7 @@ def save_state():
         return True
 
     except Exception:
-        log.exception("V15.2 state save failed")
+        log.exception("V15.3 state save failed")
         return False
 
 
@@ -412,7 +414,7 @@ def load_state():
             log.exception("Local state recovery failed")
 
     if not isinstance(saved, dict):
-        log.info("New V15.2 paper account")
+        log.info("New V15.3 paper account")
         return
 
     try:
@@ -573,7 +575,7 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V15.2 RESTORED | positions=%s | completed=%s",
+            "V15.3 RESTORED | positions=%s | completed=%s",
             len(state["positions"]),
             len(state["history"])
         )
@@ -581,7 +583,7 @@ def load_state():
         save_state()
 
     except Exception:
-        log.exception("V15.2 state loading failed")
+        log.exception("V15.3 state loading failed")
 
 
 def reset_daily():
@@ -1402,7 +1404,24 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if balance <= 0:
             return False
 
+        # CHECK PAPER AVAILABLE BALANCE AFTER EXISTING MARGIN
+        used_margin = sum(
+            number(p.get("margin"))
+            for p in state["positions"]
+        )
+
+        available_balance = max(
+            0.0,
+            balance - used_margin
+        )
+
+        if available_balance <= 0:
+            log.info("NO AVAILABLE PAPER BALANCE | %s", symbol)
+            return False
+
+        # ORIGINAL RISK-BASED POSITION SIZING
         stop_distance = price * STOP_LOSS_PERCENT
+
         risk_amount = min(
             RISK_PER_TRADE,
             balance * 0.005
@@ -1410,16 +1429,59 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
         quantity = risk_amount / stop_distance
 
+        # MINIMUM $60 POSITION NOTIONAL
+        minimum_quantity = MIN_TRADE_NOTIONAL / price
+        quantity = max(quantity, minimum_quantity)
+
+        # EXISTING EXPOSURE LIMIT
         max_notional = balance * MAX_EQUITY_EXPOSURE
-        quantity = min(quantity, max_notional / price)
+
+        # CHECK AVAILABLE PAPER MARGIN AT 8X LEVERAGE
+        affordable_notional = available_balance * LEVERAGE
+
+        max_notional = min(
+            max_notional,
+            affordable_notional
+        )
+
+        # REQUIRE AT LEAST $60 AVAILABLE NOTIONAL
+        if max_notional < MIN_TRADE_NOTIONAL:
+            log.info(
+                "INSUFFICIENT AVAILABLE BALANCE | %s | Available %.2f",
+                symbol,
+                available_balance
+            )
+            return False
+
+        quantity = min(
+            quantity,
+            max_notional / price
+        )
 
         if quantity <= 0:
             return False
 
         notional = quantity * price
+
+        # FINAL MINIMUM NOTIONAL CHECK
+        if notional < MIN_TRADE_NOTIONAL:
+            log.info(
+                "POSITION BELOW $60 MINIMUM | %s | %.2f",
+                symbol,
+                notional
+            )
+            return False
+
         margin = notional / LEVERAGE
 
-        if margin > balance:
+        # FINAL AVAILABLE BALANCE CHECK
+        if margin > available_balance:
+            log.info(
+                "INSUFFICIENT PAPER MARGIN | %s | Needed %.2f | Available %.2f",
+                symbol,
+                margin,
+                available_balance
+            )
             return False
 
         if side == "LONG":
@@ -1456,6 +1518,14 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
         state["positions"].append(position)
 
+        log.info(
+            "PAPER BALANCE CHECK | Balance %.2f | Used Margin %.2f | Available %.2f | New Margin %.2f",
+            balance,
+            used_margin,
+            available_balance,
+            margin
+        )
+
     saved = save_state()
 
     if not saved:
@@ -1466,12 +1536,14 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         return False
 
     log.info(
-        "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f | TP %.8f | Risk %.4f",
+        "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f | TP %.8f | Notional %.2f | Margin %.2f | Risk %.4f",
         side,
         symbol,
         price,
         stop_price,
         target_price,
+        notional,
+        margin,
         position["risk_amount"]
     )
 
@@ -1849,7 +1921,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V15.2 worker started")
+    log.info("CoinSentra V15.3 worker started")
     last_private_check = 0.0
 
     while True:
@@ -2013,7 +2085,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V15.2</title>
+<title>CoinSentra Trading Brain V15.3</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -2043,7 +2115,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V15.2 | BYBIT | PAPER MODE ONLY | 5M ONLY</div>
+<div class="small">TRADING BRAIN V15.3 | BYBIT | PAPER MODE ONLY | 5M ONLY | MAX 3 POSITIONS | $60 MINIMUM</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2051,7 +2123,7 @@ th{color:#9bb0ce}
 <div class="card">Unrealized PNL<div class="big" id="unrealized">$0.00</div></div>
 <div class="card">Daily Net PNL<div class="big" id="daily">$0.00</div></div>
 <div class="card">Available Balance<div class="big" id="available">$10,000</div></div>
-<div class="card">Open Positions<div class="big" id="count">0</div></div>
+<div class="card">Open Positions<div class="big" id="count">0 / 3</div></div>
 </div>
 
 <div class="card">
@@ -2135,7 +2207,8 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 15.2 | 5-minute candles only<br>
+Version 15.3 | 5-minute candles only<br>
+Maximum 3 simultaneous positions | Minimum $60 notional each<br>
 Fixed stop loss 1.5% | Fixed take profit 1.7%<br>
 10-minute re-entry cooldown | Paper trading only<br>
 Fee estimate 0.055% per side<br>
@@ -2190,7 +2263,7 @@ async function update(){
   document.getElementById('unrealized').textContent=money(d.unrealized);
   document.getElementById('daily').textContent=money(d.daily_pnl);
   document.getElementById('available').textContent=money(d.available_balance);
-  document.getElementById('count').textContent=d.positions.length;
+  document.getElementById('count').textContent=d.positions.length+' / 3';
 
   document.getElementById('control').textContent=
    d.running?'TRADING ACTIVE - NEW ENTRIES ENABLED':'TRADING ENDED - MONITORING OPEN POSITIONS';
