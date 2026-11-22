@@ -14,10 +14,11 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.4
+# COINSENTRA TRADING BRAIN V16.5
 # BYBIT | RENDER | SUPABASE | PAPER TRADING ONLY
-# 15-MINUTE STRATEGY | FIXED SL/TP | HISTORY RECOVERY
-# 3 POSITIONS | MINIMUM $60 PER TRADE | BALANCE CHECK
+# 5M RSI CONFIRMATION | 15M TREND CONFIRMATION
+# FIXED SL/TP | HISTORY RECOVERY | 3 POSITIONS
+# MINIMUM $60 PER TRADE | BALANCE CHECK
 # ============================================================
 
 app = Flask(__name__)
@@ -50,10 +51,10 @@ MAX_EQUITY_EXPOSURE = 0.10
 SCAN_SECONDS = 30
 ENTRY_SCORE = 60
 
-# ONLY 15-MINUTE COMPLETED MARKET CANDLES
-TRADING_INTERVAL = "15"
+RSI_INTERVAL = "5"
+TREND_INTERVAL = "15"
+TRADING_INTERVAL = TREND_INTERVAL
 
-# FIXED STOP LOSS / TAKE PROFIT
 STOP_LOSS_PERCENT = 0.014
 TAKE_PROFIT_PERCENT = 0.017
 
@@ -62,7 +63,7 @@ COOLDOWN_SECONDS = 60
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "16.4"
+VERSION = "16.5"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -87,15 +88,12 @@ DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
 STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v16.json")
 
-# API credentials
 API_KEY = "YOUR_BYBIT_API_KEY"
 API_SECRET = "YOUR_BYBIT_API_SECRET"
 
-# SUPABASE
 SUPABASE_URL = "YOUR_SUPABASE_URL"
 SUPABASE_KEY = "YOUR_SUPABASE_KEY"
 
-# Environment variables override code placeholders
 API_KEY = os.getenv("BYBIT_API_KEY", API_KEY).strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", API_SECRET).strip()
 
@@ -348,11 +346,6 @@ def clean_trade(trade):
 
 
 def save_state():
-    """
-    Supabase primary storage.
-    Local JSON backup is retained as fallback.
-    """
-
     try:
         with storage_lock:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -393,18 +386,16 @@ def save_state():
         return True
 
     except Exception:
-        log.exception("V16.4 state save failed")
+        log.exception("V16.5 state save failed")
         return False
 
 
 def load_state():
     saved = None
 
-    # Supabase has priority.
     if SUPABASE_ENABLED:
         saved = supabase_load()
 
-    # Local backup fallback.
     if saved is None and os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -413,7 +404,7 @@ def load_state():
             log.exception("Local state recovery failed")
 
     if not isinstance(saved, dict):
-        log.info("New V16.4 paper account")
+        log.info("New V16.5 paper account")
         return
 
     try:
@@ -574,7 +565,7 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V16.4 RESTORED | positions=%s | completed=%s",
+            "V16.5 RESTORED | positions=%s | completed=%s",
             len(state["positions"]),
             len(state["history"])
         )
@@ -582,7 +573,7 @@ def load_state():
         save_state()
 
     except Exception:
-        log.exception("V16.4 state loading failed")
+        log.exception("V16.5 state loading failed")
 
 
 def reset_daily():
@@ -833,12 +824,12 @@ def get_price(symbol):
     return price
 
 
-def get_candles(symbol, interval=TRADING_INTERVAL, limit=200):
+def get_candles(symbol, interval="15", limit=200):
     result = check_bybit_result(
         public_api.get_kline(
             category=CATEGORY,
             symbol=symbol,
-            interval=TRADING_INTERVAL,
+            interval=interval,
             limit=limit
         )
     )
@@ -1144,9 +1135,8 @@ def analyze_candles(candles):
         "atr": atr(candles)
     }
 
-
 # ============================================================
-# 15-MINUTE SIGNAL ENGINE
+# 5-MIN RSI + 15-MIN TREND SIGNAL ENGINE
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
@@ -1159,22 +1149,24 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         name: 0.0 for name in LEARNING_FEATURES
     }
 
-    if five["ema9"] > five["ema21"]:
+    # TREND INDICATORS FROM 15-MINUTE CANDLES
+    if fifteen["ema9"] > fifteen["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
 
-    elif five["ema9"] < five["ema21"]:
+    elif fifteen["ema9"] < fifteen["ema21"]:
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
 
-    if five["ema21"] > five["ema50"]:
+    if fifteen["ema21"] > fifteen["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
 
-    elif five["ema21"] < five["ema50"]:
+    elif fifteen["ema21"] < fifteen["ema50"]:
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
+    # RSI CONFIRMATION FROM 5-MINUTE CANDLES ONLY
     if 50 <= five["rsi"] <= 68:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
@@ -1183,23 +1175,26 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
-    if five["macd"] > 0:
+    # MACD FROM 15-MINUTE CANDLES
+    if fifteen["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
 
-    elif five["macd"] < 0:
+    elif fifteen["macd"] < 0:
         features["macd"] = -1
         short_score += 8 * weights["macd"]
 
-    if five["volume_ratio"] >= 1.15:
-        if five["ema9"] > five["ema21"]:
+    # VOLUME FROM 15-MINUTE CANDLES
+    if fifteen["volume_ratio"] >= 1.15:
+        if fifteen["ema9"] > fifteen["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
 
-        elif five["ema9"] < five["ema21"]:
+        elif fifteen["ema9"] < fifteen["ema21"]:
             features["volume"] = -1
             short_score += 8 * weights["volume"]
 
+    # ORDERBOOK
     if imbalance > 0.15:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
@@ -1208,30 +1203,36 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
-    # CONFIRMATION USING 15-MINUTE TREND
-    if five["ema9"] > five["ema21"]:
+    # 15-MINUTE TREND CONFIRMATION
+    if fifteen["ema9"] > fifteen["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
 
-    elif five["ema9"] < five["ema21"]:
+    elif fifteen["ema9"] < fifteen["ema21"]:
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    # HIGHER-TIMEFRAME TREND STRENGTH
-    if five["ema9"] > five["ema21"] and five["ema21"] > five["ema50"]:
+    # 15-MINUTE HIGHER-TIMEFRAME TREND STRENGTH
+    if (
+        fifteen["ema9"] > fifteen["ema21"]
+        and fifteen["ema21"] > fifteen["ema50"]
+    ):
         features["higher_timeframe"] = 1
         long_score += 20 * weights["higher_timeframe"]
 
-    elif five["ema9"] < five["ema21"] and five["ema21"] < five["ema50"]:
+    elif (
+        fifteen["ema9"] < fifteen["ema21"]
+        and fifteen["ema21"] < fifteen["ema50"]
+    ):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
-    if five["adx"] >= 18:
-        if five["ema9"] > five["ema21"]:
+    if fifteen["adx"] >= 18:
+        if fifteen["ema9"] > fifteen["ema21"]:
             features["adx"] = 1
             long_score += 6 * weights["adx"]
 
-        elif five["ema9"] < five["ema21"]:
+        elif fifteen["ema9"] < fifteen["ema21"]:
             features["adx"] = -1
             short_score += 6 * weights["adx"]
 
@@ -1244,11 +1245,11 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         long_score += 2 * weights["funding"]
 
     if oi_change > 0.2:
-        if five["ema9"] > five["ema21"]:
+        if fifteen["ema9"] > fifteen["ema21"]:
             features["open_interest"] = 1
             long_score += 2 * weights["open_interest"]
 
-        elif five["ema9"] < five["ema21"]:
+        elif fifteen["ema9"] < fifteen["ema21"]:
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
 
@@ -1257,29 +1258,31 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
 
     signal = "WAIT"
 
+    # BOTH CONFIRMATIONS ARE REQUIRED:
+    # 5-MIN RSI + 15-MIN TREND
     long_confirmed = (
-        five["ema9"] > five["ema21"]
-        and five["ema21"] > five["ema50"]
-        and five["rsi"] >= 50
+        five["rsi"] >= 50
         and five["rsi"] <= 68
-        and five["adx"] >= 18
-        and five["volume_ratio"] >= 1.15
+        and fifteen["ema9"] > fifteen["ema21"]
+        and fifteen["ema21"] > fifteen["ema50"]
+        and fifteen["adx"] >= 18
+        and fifteen["volume_ratio"] >= 1.15
     )
 
     short_confirmed = (
-        five["ema9"] < five["ema21"]
-        and five["ema21"] < five["ema50"]
-        and five["rsi"] >= 32
+        five["rsi"] >= 32
         and five["rsi"] <= 50
-        and five["adx"] >= 18
-        and five["volume_ratio"] >= 1.15
+        and fifteen["ema9"] < fifteen["ema21"]
+        and fifteen["ema21"] < fifteen["ema50"]
+        and fifteen["adx"] >= 18
+        and fifteen["volume_ratio"] >= 1.15
     )
 
     if (
         long_score >= ENTRY_SCORE
         and long_score - short_score >= 15
         and long_confirmed
-        and five["price"] > five["ema21"]
+        and fifteen["price"] > fifteen["ema21"]
     ):
         signal = "LONG"
 
@@ -1287,7 +1290,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         short_score >= ENTRY_SCORE
         and short_score - long_score >= 15
         and short_confirmed
-        and five["price"] < five["ema21"]
+        and fifteen["price"] < fifteen["ema21"]
     ):
         signal = "SHORT"
 
@@ -1403,7 +1406,6 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if balance <= 0:
             return False
 
-        # CHECK PAPER AVAILABLE BALANCE AFTER EXISTING MARGIN
         used_margin = sum(
             number(p.get("margin"))
             for p in state["positions"]
@@ -1418,7 +1420,6 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             log.info("NO AVAILABLE PAPER BALANCE | %s", symbol)
             return False
 
-        # ORIGINAL RISK-BASED POSITION SIZING
         stop_distance = price * STOP_LOSS_PERCENT
 
         risk_amount = min(
@@ -1428,14 +1429,10 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
         quantity = risk_amount / stop_distance
 
-        # MINIMUM $60 POSITION NOTIONAL
         minimum_quantity = MIN_TRADE_NOTIONAL / price
         quantity = max(quantity, minimum_quantity)
 
-        # EXISTING EXPOSURE LIMIT
         max_notional = balance * MAX_EQUITY_EXPOSURE
-
-        # CHECK AVAILABLE PAPER MARGIN AT 8X LEVERAGE
         affordable_notional = available_balance * LEVERAGE
 
         max_notional = min(
@@ -1443,7 +1440,6 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             affordable_notional
         )
 
-        # REQUIRE AT LEAST $60 AVAILABLE NOTIONAL
         if max_notional < MIN_TRADE_NOTIONAL:
             log.info(
                 "INSUFFICIENT AVAILABLE BALANCE | %s | Available %.2f",
@@ -1462,7 +1458,6 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
         notional = quantity * price
 
-        # FINAL MINIMUM NOTIONAL CHECK
         if notional < MIN_TRADE_NOTIONAL:
             log.info(
                 "POSITION BELOW $60 MINIMUM | %s | %.2f",
@@ -1473,7 +1468,6 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
         margin = notional / LEVERAGE
 
-        # FINAL AVAILABLE BALANCE CHECK
         if margin > available_balance:
             log.info(
                 "INSUFFICIENT PAPER MARGIN | %s | Needed %.2f | Available %.2f",
@@ -1844,13 +1838,18 @@ def check_private_account():
 
 
 # ============================================================
-# SCANNER - 15 MINUTES ONLY
+# SCANNER - 5M RSI + 15M TREND
 # ============================================================
 
 def scan_symbol(symbol):
-    candles = get_candles(symbol, TRADING_INTERVAL, 200)
+    # TRUE 5-MINUTE CANDLES FOR RSI CONFIRMATION
+    five_candles = get_candles(symbol, RSI_INTERVAL, 200)
+    five = analyze_candles(five_candles)
 
-    fifteen = analyze_candles(candles)
+    # TRUE 15-MINUTE CANDLES FOR TREND CONFIRMATION
+    fifteen_candles = get_candles(symbol, TREND_INTERVAL, 200)
+    fifteen = analyze_candles(fifteen_candles)
+
     fifteen["price"] = get_price(symbol)
 
     imbalance = get_orderbook(symbol)
@@ -1858,7 +1857,7 @@ def scan_symbol(symbol):
     oi_change = get_open_interest(symbol)
 
     signal = calculate_signal(
-        fifteen,
+        five,
         fifteen,
         fifteen,
         imbalance,
@@ -1879,7 +1878,9 @@ def scan_symbol(symbol):
     data = {
         "symbol": symbol,
         "price": fifteen["price"],
-        "rsi": round(fifteen["rsi"], 2),
+        "rsi": round(five["rsi"], 2),
+        "rsi_5m": round(five["rsi"], 2),
+        "rsi_15m": round(fifteen["rsi"], 2),
         "macd": round(fifteen["macd"], 8),
         "adx": round(fifteen["adx"], 2),
         "atr": round(fifteen["atr"], 8),
@@ -1920,7 +1921,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.4 worker started")
+    log.info("CoinSentra V16.5 worker started")
     last_private_check = 0.0
 
     while True:
@@ -2084,7 +2085,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.4</title>
+<title>CoinSentra Trading Brain V16.5</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -2114,7 +2115,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.4 | BYBIT | PAPER MODE ONLY | 15M ONLY | MAX 3 POSITIONS | $60 MINIMUM</div>
+<div class="small">TRADING BRAIN V16.5 | BYBIT | PAPER MODE ONLY | 5M RSI + 15M TREND | MAX 3 POSITIONS | $60 MINIMUM</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2180,7 +2181,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card">
-<h2>INDICATORS (15M)</h2>
+<h2>INDICATORS (5M RSI / 15M TREND)</h2>
 <div id="indicators" class="small">Waiting for market data...</div>
 </div>
 
@@ -2206,7 +2207,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.4 | 15-minute candles only<br>
+Version 16.5 | 5-minute RSI confirmation + 15-minute trend confirmation<br>
 Maximum 3 simultaneous positions | Minimum $60 notional each<br>
 Fixed stop loss 1.4% | Fixed take profit 1.7%<br>
 1-minute re-entry cooldown | Paper trading only<br>
@@ -2320,9 +2321,10 @@ async function update(){
    <td>${safe(s.hourly_trend||'-')}</td></tr>`;
 
    details+=`<p><b>${safe(s.symbol)}</b> |
-   RSI ${s.rsi??'-'} | ADX ${s.adx??'-'} |
+   5M RSI ${s.rsi_5m??'-'} | 15M RSI ${s.rsi_15m??'-'} |
+   15M ADX ${s.adx??'-'} |
    ATR ${price(s.atr)} |
-   Volume ${s.volume_ratio??'-'}x |
+   15M Volume ${s.volume_ratio??'-'}x |
    Orderbook ${s.orderbook_imbalance??'-'} |
    Funding ${s.funding??'-'} |
    OI ${s.oi_change??'-'}%
@@ -2373,7 +2375,6 @@ setInterval(update,5000);
 </body>
 </html>
 """
-
 
 # ============================================================
 # WEB ROUTES
