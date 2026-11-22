@@ -14,16 +14,16 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V15.3
+# COINSENTRA TRADING BRAIN V16.4
 # BYBIT | RENDER | SUPABASE | PAPER TRADING ONLY
-# 5-MINUTE STRATEGY | FIXED SL/TP | HISTORY RECOVERY
+# 15-MINUTE STRATEGY | FIXED SL/TP | HISTORY RECOVERY
 # 3 POSITIONS | MINIMUM $60 PER TRADE | BALANCE CHECK
 # ============================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("CoinSentraV15")
+log = logging.getLogger("CoinSentraV16")
 
 # ---------------- SETTINGS ----------------
 
@@ -50,19 +50,19 @@ MAX_EQUITY_EXPOSURE = 0.10
 SCAN_SECONDS = 30
 ENTRY_SCORE = 60
 
-# ONLY 5-MINUTE MARKET CANDLES
-TRADING_INTERVAL = "5"
+# ONLY 15-MINUTE COMPLETED MARKET CANDLES
+TRADING_INTERVAL = "15"
 
 # FIXED STOP LOSS / TAKE PROFIT
-STOP_LOSS_PERCENT = 0.015
+STOP_LOSS_PERCENT = 0.014
 TAKE_PROFIT_PERCENT = 0.017
 
-COOLDOWN_SECONDS = 600
+COOLDOWN_SECONDS = 60
 
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "15.3"
+VERSION = "16.4"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -85,9 +85,9 @@ DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 # ---------------- STORAGE ----------------
 
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
-STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v15.json")
+STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v16.json")
 
-# API credentials (use newly rotated credentials)
+# API credentials
 API_KEY = "YOUR_BYBIT_API_KEY"
 API_SECRET = "YOUR_BYBIT_API_SECRET"
 
@@ -158,7 +158,6 @@ state = {
         "processed_trade_ids": []
     }
 }
-
 
 # ============================================================
 # GENERAL HELPERS
@@ -394,7 +393,7 @@ def save_state():
         return True
 
     except Exception:
-        log.exception("V15.3 state save failed")
+        log.exception("V16.4 state save failed")
         return False
 
 
@@ -414,7 +413,7 @@ def load_state():
             log.exception("Local state recovery failed")
 
     if not isinstance(saved, dict):
-        log.info("New V15.3 paper account")
+        log.info("New V16.4 paper account")
         return
 
     try:
@@ -575,7 +574,7 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V15.3 RESTORED | positions=%s | completed=%s",
+            "V16.4 RESTORED | positions=%s | completed=%s",
             len(state["positions"]),
             len(state["history"])
         )
@@ -583,7 +582,7 @@ def load_state():
         save_state()
 
     except Exception:
-        log.exception("V15.3 state loading failed")
+        log.exception("V16.4 state loading failed")
 
 
 def reset_daily():
@@ -834,12 +833,12 @@ def get_price(symbol):
     return price
 
 
-def get_candles(symbol, interval="5", limit=200):
+def get_candles(symbol, interval=TRADING_INTERVAL, limit=200):
     result = check_bybit_result(
         public_api.get_kline(
             category=CATEGORY,
             symbol=symbol,
-            interval="5",
+            interval=TRADING_INTERVAL,
             limit=limit
         )
     )
@@ -1147,7 +1146,7 @@ def analyze_candles(candles):
 
 
 # ============================================================
-# 5-MINUTE SIGNAL ENGINE
+# 15-MINUTE SIGNAL ENGINE
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
@@ -1209,7 +1208,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
-    # Confirmation is derived from the same 5-minute candles.
+    # CONFIRMATION USING 15-MINUTE TREND
     if five["ema9"] > five["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
@@ -1218,7 +1217,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    # Higher-timeframe feature repurposed as 5m trend strength.
+    # HIGHER-TIMEFRAME TREND STRENGTH
     if five["ema9"] > five["ema21"] and five["ema21"] > five["ema50"]:
         features["higher_timeframe"] = 1
         long_score += 20 * weights["higher_timeframe"]
@@ -1845,23 +1844,23 @@ def check_private_account():
 
 
 # ============================================================
-# SCANNER - 5 MINUTES ONLY
+# SCANNER - 15 MINUTES ONLY
 # ============================================================
 
 def scan_symbol(symbol):
     candles = get_candles(symbol, TRADING_INTERVAL, 200)
 
-    five = analyze_candles(candles)
-    five["price"] = get_price(symbol)
+    fifteen = analyze_candles(candles)
+    fifteen["price"] = get_price(symbol)
 
     imbalance = get_orderbook(symbol)
     funding = get_funding(symbol)
     oi_change = get_open_interest(symbol)
 
     signal = calculate_signal(
-        five,
-        five,
-        five,
+        fifteen,
+        fifteen,
+        fifteen,
         imbalance,
         funding,
         oi_change
@@ -1869,25 +1868,25 @@ def scan_symbol(symbol):
 
     trend = (
         "BULLISH"
-        if five["ema9"] > five["ema21"]
-        and five["ema21"] > five["ema50"]
+        if fifteen["ema9"] > fifteen["ema21"]
+        and fifteen["ema21"] > fifteen["ema50"]
         else "BEARISH"
-        if five["ema9"] < five["ema21"]
-        and five["ema21"] < five["ema50"]
+        if fifteen["ema9"] < fifteen["ema21"]
+        and fifteen["ema21"] < fifteen["ema50"]
         else "MIXED"
     )
 
     data = {
         "symbol": symbol,
-        "price": five["price"],
-        "rsi": round(five["rsi"], 2),
-        "macd": round(five["macd"], 8),
-        "adx": round(five["adx"], 2),
-        "atr": round(five["atr"], 8),
-        "ema9": round(five["ema9"], 8),
-        "ema21": round(five["ema21"], 8),
-        "ema50": round(five["ema50"], 8),
-        "volume_ratio": round(five["volume_ratio"], 2),
+        "price": fifteen["price"],
+        "rsi": round(fifteen["rsi"], 2),
+        "macd": round(fifteen["macd"], 8),
+        "adx": round(fifteen["adx"], 2),
+        "atr": round(fifteen["atr"], 8),
+        "ema9": round(fifteen["ema9"], 8),
+        "ema21": round(fifteen["ema21"], 8),
+        "ema50": round(fifteen["ema50"], 8),
+        "volume_ratio": round(fifteen["volume_ratio"], 2),
         "orderbook_imbalance": round(imbalance, 3),
         "funding": funding,
         "oi_change": round(oi_change, 3),
@@ -1908,9 +1907,9 @@ def scan_symbol(symbol):
         open_paper_position(
             symbol,
             signal["signal"],
-            five["price"],
+            fifteen["price"],
             signal["features"],
-            five["atr"]
+            fifteen["atr"]
         )
 
     return data
@@ -1921,7 +1920,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V15.3 worker started")
+    log.info("CoinSentra V16.4 worker started")
     last_private_check = 0.0
 
     while True:
@@ -1978,7 +1977,7 @@ def start_worker_once():
 
         thread = threading.Thread(
             target=background_worker,
-            name="CoinSentraV15Worker",
+            name="CoinSentraV16Worker",
             daemon=True
         )
 
@@ -2085,7 +2084,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V15.3</title>
+<title>CoinSentra Trading Brain V16.4</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -2115,7 +2114,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V15.3 | BYBIT | PAPER MODE ONLY | 5M ONLY | MAX 3 POSITIONS | $60 MINIMUM</div>
+<div class="small">TRADING BRAIN V16.4 | BYBIT | PAPER MODE ONLY | 15M ONLY | MAX 3 POSITIONS | $60 MINIMUM</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2174,14 +2173,14 @@ th{color:#9bb0ce}
 <div id="scanner" class="small">WAITING FOR MARKET DATA</div>
 <div class="scroll">
 <table>
-<thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>5M TREND</th></tr></thead>
+<thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>15M TREND</th></tr></thead>
 <tbody id="markets"></tbody>
 </table>
 </div>
 </div>
 
 <div class="card">
-<h2>INDICATORS (5M)</h2>
+<h2>INDICATORS (15M)</h2>
 <div id="indicators" class="small">Waiting for market data...</div>
 </div>
 
@@ -2207,10 +2206,10 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 15.3 | 5-minute candles only<br>
+Version 16.4 | 15-minute candles only<br>
 Maximum 3 simultaneous positions | Minimum $60 notional each<br>
-Fixed stop loss 1.5% | Fixed take profit 1.7%<br>
-10-minute re-entry cooldown | Paper trading only<br>
+Fixed stop loss 1.4% | Fixed take profit 1.7%<br>
+1-minute re-entry cooldown | Paper trading only<br>
 Fee estimate 0.055% per side<br>
 Last scan: <span id="last">Waiting</span><br>
 Last error: <span id="error">None</span>
