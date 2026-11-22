@@ -6,7 +6,6 @@ import logging
 import math
 import uuid
 import hashlib
-import copy
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, date
@@ -15,15 +14,14 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.8 FIXED
+# COINSENTRA TRADING BRAIN V16.8
 # BYBIT | RENDER | SUPABASE | PAPER TRADING
 # RELIABLE STATE | FRESH SCANNER | EASIER ENTRIES
 # CANDLESTICK PATTERN RECOGNITION
 # RSI 50 DIRECTION | VOLUME 0.50x ENTRY
-# FIXED TRADE LIFECYCLE | ATOMIC CLOSE | STATE RECOVERY
 # ============================================================
 
-VERSION = "16.8-FIXED"
+VERSION = "16.8"
 
 SYMBOLS = [
     "ETHUSDT",
@@ -55,14 +53,23 @@ FEE_RATE = 0.00055
 PAPER_TRADING = True
 MAX_HISTORY = 500
 
+# Easier entry settings
 RSI_BULLISH_LEVEL = 50
 RSI_BEARISH_LEVEL = 50
 MIN_VOLUME_RATIO = 0.50
 
 LEARNING_FEATURES = [
-    "trend_fast", "trend_slow", "rsi", "macd", "volume",
-    "orderbook", "confirmation", "higher_timeframe", "adx",
-    "funding", "open_interest"
+    "trend_fast",
+    "trend_slow",
+    "rsi",
+    "macd",
+    "volume",
+    "orderbook",
+    "confirmation",
+    "higher_timeframe",
+    "adx",
+    "funding",
+    "open_interest"
 ]
 
 LEARNING_MIN_SAMPLES = 10
@@ -71,6 +78,7 @@ LEARNING_MIN_WEIGHT = 0.75
 LEARNING_MAX_WEIGHT = 1.25
 LEARNING_RATE = 0.15
 
+# Candlestick settings
 CANDLE_PATTERN_SCORE = 8
 CANDLE_STRONG_PATTERN_SCORE = 10
 
@@ -88,7 +96,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 SUPABASE_ENABLED = bool(
-    SUPABASE_URL.startswith("https://") and SUPABASE_KEY
+    SUPABASE_URL.startswith("https://")
+    and SUPABASE_KEY
 )
 
 # ============================================================
@@ -110,14 +119,17 @@ app = Flask(__name__)
 
 lock = threading.RLock()
 worker_lock = threading.Lock()
-save_lock = threading.Lock()
 worker_started = False
 
 # ============================================================
 # BYBIT
 # ============================================================
 
-public_api = HTTP(testnet=False, timeout=15)
+public_api = HTTP(
+    testnet=False,
+    timeout=15
+)
+
 private_api = None
 
 if BYBIT_API_KEY and BYBIT_API_SECRET:
@@ -155,7 +167,9 @@ def check_bybit_result(result):
         raise RuntimeError("Invalid Bybit response")
 
     if result.get("retCode", 0) != 0:
-        raise RuntimeError(result.get("retMsg", "Bybit API error"))
+        raise RuntimeError(
+            result.get("retMsg", "Bybit API error")
+        )
 
     return result
 
@@ -226,7 +240,7 @@ state = {
 
 def state_snapshot():
     with lock:
-        return copy.deepcopy({
+        return {
             "balance": state["balance"],
             "positions": state["positions"],
             "history": state["history"][:MAX_HISTORY],
@@ -242,7 +256,7 @@ def state_snapshot():
             "last_closed_by_symbol": state["last_closed_by_symbol"],
             "version": VERSION,
             "learning": state["learning"]
-        })
+        }
 
 # ============================================================
 # SUPABASE
@@ -304,40 +318,38 @@ def supabase_load():
     return None
 
 # ============================================================
-# SAVE STATE - LOCAL ATOMIC + REMOTE
+# SAVE STATE
 # ============================================================
 
 def save_state():
-    with save_lock:
-        snapshot = state_snapshot()
-        local_ok = False
+    snapshot = state_snapshot()
 
-        try:
-            os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
 
-            temporary = STATE_FILE + ".tmp"
+        temporary = STATE_FILE + ".tmp"
 
-            with open(temporary, "w", encoding="utf-8") as file:
-                json.dump(snapshot, file, ensure_ascii=False)
-                file.flush()
-                os.fsync(file.fileno())
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(snapshot, file, ensure_ascii=False)
 
-            os.replace(temporary, STATE_FILE)
-            local_ok = True
+            file.flush()
+            os.fsync(file.fileno())
 
-        except Exception:
-            log.exception("Local state save failed")
+        os.replace(temporary, STATE_FILE)
 
-        if SUPABASE_ENABLED:
-            remote_ok = supabase_save(snapshot)
+    except Exception:
+        log.exception("Local state save failed")
 
-            if not remote_ok:
-                log.error("REMOTE PERSISTENCE FAILED - LOCAL STATE KEPT")
+    if SUPABASE_ENABLED:
+        remote_ok = supabase_save(snapshot)
 
-            return local_ok
+        if not remote_ok:
+            log.error("REMOTE PERSISTENCE FAILED")
 
-        log.warning("Supabase not configured; Render local storage is temporary")
-        return local_ok
+        return remote_ok
+
+    log.warning("Supabase not configured; Render local storage is temporary")
+    return True
 
 # ============================================================
 # LOAD STATE
@@ -361,14 +373,18 @@ def load_state():
         return
 
     with lock:
-        state["balance"] = number(loaded.get("balance"), START_BALANCE)
+        state["balance"] = number(
+            loaded.get("balance"), START_BALANCE
+        )
 
         state["positions"] = [
-            p for p in loaded.get("positions", []) if isinstance(p, dict)
+            p for p in loaded.get("positions", [])
+            if isinstance(p, dict)
         ]
 
         state["history"] = [
-            t for t in loaded.get("history", []) if isinstance(t, dict)
+            t for t in loaded.get("history", [])
+            if isinstance(t, dict)
         ][:MAX_HISTORY]
 
         state["daily_pnl"] = number(loaded.get("daily_pnl"))
@@ -380,7 +396,9 @@ def load_state():
         state["account_balance"] = loaded.get("account_balance")
         state["symbols"] = loaded.get("symbols", {})
         state["scan_count"] = int(loaded.get("scan_count", 0))
-        state["last_closed_by_symbol"] = loaded.get("last_closed_by_symbol", {})
+        state["last_closed_by_symbol"] = loaded.get(
+            "last_closed_by_symbol", {}
+        )
         state["version"] = VERSION
 
         learning = loaded.get("learning", default_learning())
@@ -390,6 +408,7 @@ def load_state():
 
         merged_learning = default_learning()
         merged_learning.update(learning)
+
         old_weights = learning.get("weights", {})
         merged_learning["weights"] = default_weights()
 
@@ -400,15 +419,9 @@ def load_state():
                 LEARNING_MAX_WEIGHT
             )
 
-        merged_learning["processed_ids"] = list(
-            dict.fromkeys(merged_learning.get("processed_ids", []))
-        )[-1000:]
-
         state["learning"] = merged_learning
 
-        # Normalize recovered positions
-        normalized = []
-
+        # Normalize restored positions
         for position in state["positions"]:
             position["entry"] = number(position.get("entry"))
             position["quantity"] = number(position.get("quantity"))
@@ -418,33 +431,26 @@ def load_state():
             position["stop_loss"] = number(position.get("stop_loss"))
             position["take_profit"] = number(position.get("take_profit"))
 
-            if position["entry"] <= 0 or position["quantity"] <= 0:
-                continue
+            if position["entry"] > 0:
+                if position["stop_loss"] <= 0:
+                    position["stop_loss"] = (
+                        position["entry"] * (1 - STOP_LOSS_PERCENT)
+                        if position.get("side") == "LONG"
+                        else position["entry"] * (1 + STOP_LOSS_PERCENT)
+                    )
 
-            if not position.get("trade_id"):
-                position["trade_id"] = uuid.uuid4().hex
-
-            if position["stop_loss"] <= 0:
-                position["stop_loss"] = (
-                    position["entry"] * (1 - STOP_LOSS_PERCENT)
-                    if position.get("side") == "LONG"
-                    else position["entry"] * (1 + STOP_LOSS_PERCENT)
-                )
-
-            if position["take_profit"] <= 0:
-                position["take_profit"] = (
-                    position["entry"] * (1 + TAKE_PROFIT_PERCENT)
-                    if position.get("side") == "LONG"
-                    else position["entry"] * (1 - TAKE_PROFIT_PERCENT)
-                )
-
-            normalized.append(position)
-
-        state["positions"] = normalized
+                if position["take_profit"] <= 0:
+                    position["take_profit"] = (
+                        position["entry"] * (1 + TAKE_PROFIT_PERCENT)
+                        if position.get("side") == "LONG"
+                        else position["entry"] * (1 - TAKE_PROFIT_PERCENT)
+                    )
 
     log.info(
         "STATE RECOVERED | Positions %s | History %s | Balance %.2f",
-        len(state["positions"]), len(state["history"]), state["balance"]
+        len(state["positions"]),
+        len(state["history"]),
+        state["balance"]
     )
 
 # ============================================================
@@ -453,6 +459,7 @@ def load_state():
 
 def reset_daily():
     today = str(date.today())
+
     changed = False
 
     with lock:
@@ -474,20 +481,30 @@ def get_learning_weights():
 
 def learning_snapshot_for_side(features, side):
     direction = 1 if side == "LONG" else -1
-    return {name: number(features.get(name)) * direction for name in LEARNING_FEATURES}
+
+    snapshot = {}
+
+    for name in LEARNING_FEATURES:
+        snapshot[name] = number(features.get(name)) * direction
+
+    return snapshot
 
 # ============================================================
 # TRADE NORMALIZATION
 # ============================================================
 
 def clean_trade(trade):
-    if not isinstance(trade, dict) or trade.get("status") != "COMPLETED":
+    if not isinstance(trade, dict):
+        return None
+
+    if trade.get("status") != "COMPLETED":
         return None
 
     required = ["entry", "exit", "quantity", "pnl"]
 
-    if any(key not in trade for key in required):
-        return None
+    for key in required:
+        if key not in trade:
+            return None
 
     entry = number(trade.get("entry"))
     exit_price = number(trade.get("exit"))
@@ -497,6 +514,7 @@ def clean_trade(trade):
         return None
 
     result = dict(trade)
+
     result["entry"] = entry
     result["exit"] = exit_price
     result["quantity"] = quantity
@@ -505,7 +523,9 @@ def clean_trade(trade):
     result["gross_pnl"] = number(trade.get("gross_pnl"))
     result["fees"] = number(trade.get("fees"))
     result["trade_id"] = str(trade.get("trade_id") or uuid.uuid4().hex)
+
     result["status"] = "COMPLETED"
+
     return result
 
 # ============================================================
@@ -549,7 +569,9 @@ def update_learning(trade):
         learning["samples"] += 1
         learning["updates"] += 1
         learning["last_update"] = now_text()
-        learning["last_result"] = "WIN" if trade["pnl"] > 0 else "LOSS"
+        learning["last_result"] = (
+            "WIN" if trade["pnl"] > 0 else "LOSS"
+        )
 
     save_state()
 
@@ -566,7 +588,10 @@ def recover_learning():
 
 def get_price(symbol):
     result = check_bybit_result(
-        public_api.get_tickers(category=CATEGORY, symbol=symbol)
+        public_api.get_tickers(
+            category=CATEGORY,
+            symbol=symbol
+        )
     )
 
     data = result.get("result", {}).get("list", [])
@@ -592,6 +617,7 @@ def get_candles(symbol, interval, limit=200):
     )
 
     raw = result.get("result", {}).get("list", [])
+
     candles = []
 
     for row in reversed(raw):
@@ -607,19 +633,25 @@ def get_candles(symbol, interval, limit=200):
             "volume": number(row[5])
         }
 
-        if all(candle[k] > 0 for k in ("open", "high", "low", "close")):
+        if all(
+            candle[k] > 0
+            for k in ("open", "high", "low", "close")
+        ):
             candles.append(candle)
 
     if len(candles) < 60:
         raise RuntimeError("Insufficient candles")
 
-    # Exclude current incomplete candle
     return candles[:-1]
 
 def get_orderbook(symbol):
     try:
         result = check_bybit_result(
-            public_api.get_orderbook(category=CATEGORY, symbol=symbol, limit=50)
+            public_api.get_orderbook(
+                category=CATEGORY,
+                symbol=symbol,
+                limit=50
+            )
         )
 
         book = result.get("result", {})
@@ -628,6 +660,7 @@ def get_orderbook(symbol):
 
         bid_volume = sum(number(x[1]) for x in bids)
         ask_volume = sum(number(x[1]) for x in asks)
+
         total = bid_volume + ask_volume
 
         if total <= 0:
@@ -642,7 +675,10 @@ def get_orderbook(symbol):
 def get_funding(symbol):
     try:
         result = check_bybit_result(
-            public_api.get_tickers(category=CATEGORY, symbol=symbol)
+            public_api.get_tickers(
+                category=CATEGORY,
+                symbol=symbol
+            )
         )
 
         data = result.get("result", {}).get("list", [])
@@ -729,10 +765,18 @@ def bollinger(values, period=20, multiplier=2):
         return 0.0, 0.0, 0.0
 
     middle = sum(subset) / len(subset)
-    variance = sum((x - middle) ** 2 for x in subset) / len(subset)
+
+    variance = sum(
+        (x - middle) ** 2 for x in subset
+    ) / len(subset)
+
     deviation = math.sqrt(variance)
 
-    return middle + multiplier * deviation, middle, middle - multiplier * deviation
+    return (
+        middle + multiplier * deviation,
+        middle,
+        middle - multiplier * deviation
+    )
 
 def atr(candles, period=14):
     if len(candles) < period + 1:
@@ -772,15 +816,18 @@ def adx_approx(candles, period=14):
         plus_values.append(
             up_move if up_move > down_move and up_move > 0 else 0
         )
+
         minus_values.append(
             down_move if down_move > up_move and down_move > 0 else 0
         )
 
-        tr_values.append(max(
+        tr = max(
             current["high"] - current["low"],
             abs(current["high"] - previous["close"]),
             abs(current["low"] - previous["close"])
-        ))
+        )
+
+        tr_values.append(tr)
 
     tr_avg = sum(tr_values[-period:]) / period
 
@@ -789,6 +836,7 @@ def adx_approx(candles, period=14):
 
     plus_di = sum(plus_values[-period:]) / period / tr_avg * 100
     minus_di = sum(minus_values[-period:]) / period / tr_avg * 100
+
     total = plus_di + minus_di
 
     if total <= 0:
@@ -836,12 +884,23 @@ def detect_candlestick_patterns(candles):
     if len(candles) < 5:
         return result
 
-    c1, c2, c3 = candles[-1], candles[-2], candles[-3]
-    p1, p2, p3 = candle_parts(c1), candle_parts(c2), candle_parts(c3)
-    body1, body2, body3 = p1["body"], p2["body"], p3["body"]
+    c1 = candles[-1]
+    c2 = candles[-2]
+    c3 = candles[-3]
+
+    p1 = candle_parts(c1)
+    p2 = candle_parts(c2)
+    p3 = candle_parts(c3)
+
+    body1 = p1["body"]
+    body2 = p2["body"]
+    body3 = p3["body"]
+
+    # BULLISH PATTERNS
 
     if (
-        p2["bearish"] and p1["bullish"]
+        p2["bearish"]
+        and p1["bullish"]
         and c1["open"] <= c2["close"]
         and c1["close"] >= c2["open"]
         and body1 >= body2 * 1.05
@@ -857,7 +916,8 @@ def detect_candlestick_patterns(candles):
         result["bullish"].append("Hammer")
 
     if (
-        p3["bearish"] and p3["body_ratio"] > 0.5
+        p3["bearish"]
+        and p3["body_ratio"] > 0.5
         and p2["body_ratio"] < 0.35
         and p1["bullish"]
         and c1["close"] > (c3["open"] + c3["close"]) / 2
@@ -865,20 +925,32 @@ def detect_candlestick_patterns(candles):
         result["bullish"].append("Morning Star")
 
     if len(candles) >= 4:
-        b, c, d = candles[-3], candles[-2], candles[-1]
-        pb, pc, pd = candle_parts(b), candle_parts(c), candle_parts(d)
+        a = candles[-4]
+        b = candles[-3]
+        c = candles[-2]
+        d = candles[-1]
+
+        pb = candle_parts(b)
+        pc = candle_parts(c)
+        pd = candle_parts(d)
 
         if (
-            pb["bullish"] and pc["bullish"] and pd["bullish"]
-            and c["close"] > b["close"] and d["close"] > c["close"]
+            pb["bullish"]
+            and pc["bullish"]
+            and pd["bullish"]
+            and c["close"] > b["close"]
+            and d["close"] > c["close"]
             and pb["body_ratio"] > 0.45
             and pc["body_ratio"] > 0.45
             and pd["body_ratio"] > 0.45
         ):
             result["bullish"].append("Three White Soldiers")
 
+    # BEARISH PATTERNS
+
     if (
-        p2["bullish"] and p1["bearish"]
+        p2["bullish"]
+        and p1["bearish"]
         and c1["open"] >= c2["close"]
         and c1["close"] <= c2["open"]
         and body1 >= body2 * 1.05
@@ -894,7 +966,8 @@ def detect_candlestick_patterns(candles):
         result["bearish"].append("Shooting Star")
 
     if (
-        p3["bullish"] and p3["body_ratio"] > 0.5
+        p3["bullish"]
+        and p3["body_ratio"] > 0.5
         and p2["body_ratio"] < 0.35
         and p1["bearish"]
         and c1["close"] < (c3["open"] + c3["close"]) / 2
@@ -902,17 +975,28 @@ def detect_candlestick_patterns(candles):
         result["bearish"].append("Evening Star")
 
     if len(candles) >= 4:
-        b, c, d = candles[-3], candles[-2], candles[-1]
-        pb, pc, pd = candle_parts(b), candle_parts(c), candle_parts(d)
+        a = candles[-4]
+        b = candles[-3]
+        c = candles[-2]
+        d = candles[-1]
+
+        pb = candle_parts(b)
+        pc = candle_parts(c)
+        pd = candle_parts(d)
 
         if (
-            pb["bearish"] and pc["bearish"] and pd["bearish"]
-            and c["close"] < b["close"] and d["close"] < c["close"]
+            pb["bearish"]
+            and pc["bearish"]
+            and pd["bearish"]
+            and c["close"] < b["close"]
+            and d["close"] < c["close"]
             and pb["body_ratio"] > 0.45
             and pc["body_ratio"] > 0.45
             and pd["body_ratio"] > 0.45
         ):
             result["bearish"].append("Three Black Crows")
+
+    # NEUTRAL PATTERNS
 
     if p1["body_ratio"] <= 0.10:
         result["neutral"].append("Doji")
@@ -926,7 +1010,10 @@ def detect_candlestick_patterns(candles):
     bullish_count = len(result["bullish"])
     bearish_count = len(result["bearish"])
 
-    result["score"] = bullish_count * CANDLE_PATTERN_SCORE - bearish_count * CANDLE_PATTERN_SCORE
+    result["score"] = (
+        bullish_count * CANDLE_PATTERN_SCORE
+        - bearish_count * CANDLE_PATTERN_SCORE
+    )
 
     if "Three White Soldiers" in result["bullish"]:
         result["score"] += CANDLE_STRONG_PATTERN_SCORE
@@ -939,8 +1026,18 @@ def detect_candlestick_patterns(candles):
     elif result["score"] < 0:
         result["signal"] = "BEARISH"
 
-    all_patterns = result["bullish"] + result["bearish"] + result["neutral"]
-    result["display"] = " | ".join(all_patterns) if all_patterns else "No pattern"
+    all_patterns = (
+        result["bullish"]
+        + result["bearish"]
+        + result["neutral"]
+    )
+
+    result["display"] = (
+        " | ".join(all_patterns)
+        if all_patterns
+        else "No pattern"
+    )
+
     return result
 
 # ============================================================
@@ -959,10 +1056,14 @@ def analyze_candles(candles):
     e50 = ema(closes, 50)
 
     upper, middle, lower = bollinger(closes)
+
     previous_volumes = volumes[-21:-1]
     average_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0
 
-    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 0.0
+    volume_ratio = (
+        volumes[-1] / average_volume
+        if average_volume > 0 else 0.0
+    )
 
     return {
         "price": closes[-1],
@@ -980,19 +1081,24 @@ def analyze_candles(candles):
     }
 
 # ============================================================
-# SIGNAL ENGINE
+# SIGNAL ENGINE - EASIER ENTRIES + CANDLE PATTERNS
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candle_patterns=None):
     weights = get_learning_weights()
 
     candle_patterns = candle_patterns or {
-        "bullish": [], "bearish": [], "neutral": [],
-        "score": 0, "signal": "NEUTRAL", "display": "No pattern"
+        "bullish": [],
+        "bearish": [],
+        "neutral": [],
+        "score": 0,
+        "signal": "NEUTRAL",
+        "display": "No pattern"
     }
 
     long_score = 0.0
     short_score = 0.0
+
     features = {name: 0.0 for name in LEARNING_FEATURES}
 
     if fifteen["ema9"] > fifteen["ema21"]:
@@ -1009,6 +1115,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
+    # 5-minute RSI direction: above 50 bullish, below 50 bearish
     if 50 < five["rsi"] <= 70:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
@@ -1023,6 +1130,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
         features["macd"] = -1
         short_score += 8 * weights["macd"]
 
+    # Volume gate reduced to 0.50x
     if fifteen["volume_ratio"] >= MIN_VOLUME_RATIO:
         if fifteen["ema9"] > fifteen["ema21"]:
             features["volume"] = 1
@@ -1045,10 +1153,16 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    if fifteen["ema9"] > fifteen["ema21"] and fifteen["ema21"] > fifteen["ema50"]:
+    if (
+        fifteen["ema9"] > fifteen["ema21"]
+        and fifteen["ema21"] > fifteen["ema50"]
+    ):
         features["higher_timeframe"] = 1
         long_score += 20 * weights["higher_timeframe"]
-    elif fifteen["ema9"] < fifteen["ema21"] and fifteen["ema21"] < fifteen["ema50"]:
+    elif (
+        fifteen["ema9"] < fifteen["ema21"]
+        and fifteen["ema21"] < fifteen["ema50"]
+    ):
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
@@ -1075,6 +1189,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
 
+    # Candlestick pattern contribution
     candle_score = number(candle_patterns.get("score"))
 
     if candle_score > 0:
@@ -1087,16 +1202,20 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
 
     signal = "WAIT"
 
+    # Easier LONG confirmation
     long_confirmed = (
-        five["rsi"] > 50 and five["rsi"] <= 70
+        five["rsi"] > 50
+        and five["rsi"] <= 70
         and fifteen["ema9"] > fifteen["ema21"]
         and fifteen["ema21"] > fifteen["ema50"]
         and fifteen["adx"] >= 16
         and fifteen["volume_ratio"] >= MIN_VOLUME_RATIO
     )
 
+    # Easier SHORT confirmation
     short_confirmed = (
-        five["rsi"] < 50 and five["rsi"] >= 30
+        five["rsi"] < 50
+        and five["rsi"] >= 30
         and fifteen["ema9"] < fifteen["ema21"]
         and fifteen["ema21"] < fifteen["ema50"]
         and fifteen["adx"] >= 16
@@ -1110,6 +1229,7 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change, candl
         and fifteen["price"] > fifteen["ema21"]
     ):
         signal = "LONG"
+
     elif (
         short_score >= ENTRY_SCORE
         and short_score - long_score >= 12
@@ -1156,7 +1276,7 @@ def position_net_pnl(position, price):
 def account_totals():
     with lock:
         balance = number(state["balance"])
-        positions = copy.deepcopy(state["positions"])
+        positions = [dict(p) for p in state["positions"]]
 
     unrealized = sum(number(p.get("unrealized_pnl")) for p in positions)
     used_margin = sum(number(p.get("margin")) for p in positions)
@@ -1191,7 +1311,10 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         return False
 
     with lock:
-        if not state["running"] or len(state["positions"]) >= MAX_POSITIONS:
+        if not state["running"]:
+            return False
+
+        if len(state["positions"]) >= MAX_POSITIONS:
             return False
 
         if any(p.get("symbol") == symbol for p in state["positions"]):
@@ -1202,6 +1325,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             return False
 
         balance = number(state["balance"])
+
         if balance <= 0:
             return False
 
@@ -1212,6 +1336,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             return False
 
         stop_distance = price * STOP_LOSS_PERCENT
+
         risk_amount = min(RISK_PER_TRADE, balance * 0.005)
 
         quantity = risk_amount / stop_distance
@@ -1226,14 +1351,17 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             return False
 
         quantity = min(quantity, max_notional / price)
+
         if quantity <= 0:
             return False
 
         notional = quantity * price
+
         if notional < MIN_TRADE_NOTIONAL:
             return False
 
         margin = notional / LEVERAGE
+
         if margin > available_balance:
             return False
 
@@ -1269,8 +1397,17 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
 
         state["positions"].append(position)
 
-    # Save failure must not delete the live in-memory paper position.
-    save_state()
+    saved = save_state()
+
+    if not saved:
+        with lock:
+            state["positions"] = [
+                p for p in state["positions"]
+                if p.get("trade_id") != position["trade_id"]
+            ]
+
+        log.error("POSITION ROLLED BACK - STATE SAVE FAILED")
+        return False
 
     log.info(
         "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f | TP %.8f | Notional %.2f | Margin %.2f",
@@ -1280,7 +1417,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
     return True
 
 # ============================================================
-# COMPLETED TRADE ENGINE - ATOMIC / IDEMPOTENT
+# COMPLETED TRADE ENGINE
 # ============================================================
 
 def close_paper_position(position, price, reason):
@@ -1301,15 +1438,21 @@ def close_paper_position(position, price, reason):
         if live is None:
             return False
 
-        if any(t.get("trade_id") == trade_id for t in state["history"]):
-            state["positions"].remove(live)
-            return False
-
         entry = number(live.get("entry"))
         quantity = number(live.get("quantity"))
 
         if entry <= 0 or quantity <= 0:
             return False
+
+        existing = next(
+            (t for t in state["history"] if t.get("trade_id") == trade_id),
+            None
+        )
+
+        if existing is not None and clean_trade(existing):
+            state["positions"].remove(live)
+            save_state()
+            return True
 
         gross = position_gross_pnl(live, price)
         fees = position_fees(live, price)
@@ -1336,7 +1479,12 @@ def close_paper_position(position, price, reason):
             "feature_snapshot": dict(live.get("feature_snapshot", {}))
         }
 
-        # Commit trade to in-memory state exactly once.
+        old_balance = state["balance"]
+        old_daily = state["daily_pnl"]
+        old_history = list(state["history"])
+        old_positions = list(state["positions"])
+        old_running = state["running"]
+
         state["history"].insert(0, trade)
         state["history"] = state["history"][:MAX_HISTORY]
         state["balance"] += net
@@ -1347,18 +1495,23 @@ def close_paper_position(position, price, reason):
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             state["running"] = False
 
-    # Persistence failure does not reverse completed trade accounting.
-    save_state()
+    saved = save_state()
+
+    if not saved:
+        with lock:
+            state["balance"] = old_balance
+            state["daily_pnl"] = old_daily
+            state["history"] = old_history
+            state["positions"] = old_positions
+            state["running"] = old_running
+
+        log.error("TRADE CLOSE ROLLED BACK - SAVE FAILED")
+        return False
 
     try:
         update_learning(trade)
     except Exception:
         log.exception("Learning update failed")
-
-    log.info(
-        "PAPER CLOSE | %s | %s | Exit %.8f | Gross %.6f | Fees %.6f | Net %.6f | %s",
-        trade["side"], trade["symbol"], price, gross, fees, net, reason
-    )
 
     return True
 
@@ -1368,7 +1521,7 @@ def close_paper_position(position, price, reason):
 
 def monitor_positions():
     with lock:
-        positions = copy.deepcopy(state["positions"])
+        positions = [dict(p) for p in state["positions"]]
 
     changed = False
 
@@ -1388,6 +1541,7 @@ def monitor_positions():
                 continue
 
             price = get_price(position["symbol"])
+
             net = position_net_pnl(position, price)
             gross = position_gross_pnl(position, price)
 
@@ -1485,6 +1639,7 @@ def scan_symbol(symbol):
     fifteen = analyze_candles(fifteen_candles)
 
     fifteen["price"] = get_price(symbol)
+
     candle_patterns = detect_candlestick_patterns(five_candles)
 
     imbalance = get_orderbook(symbol)
@@ -1492,7 +1647,13 @@ def scan_symbol(symbol):
     oi_change = get_open_interest(symbol)
 
     signal = calculate_signal(
-        five, fifteen, fifteen, imbalance, funding, oi_change, candle_patterns
+        five,
+        fifteen,
+        fifteen,
+        imbalance,
+        funding,
+        oi_change,
+        candle_patterns
     )
 
     trend = (
@@ -1531,8 +1692,11 @@ def scan_symbol(symbol):
 
     if should_open:
         open_paper_position(
-            symbol, signal["signal"], fifteen["price"],
-            signal["features"], fifteen["atr"]
+            symbol,
+            signal["signal"],
+            fifteen["price"],
+            signal["features"],
+            fifteen["atr"]
         )
 
     return data
@@ -1543,6 +1707,7 @@ def scan_symbol(symbol):
 
 def background_worker():
     log.info("CoinSentra V16.8 worker started")
+
     last_private_check = 0.0
 
     while True:
@@ -1555,6 +1720,7 @@ def background_worker():
             for symbol in SYMBOLS:
                 try:
                     scan_symbol(symbol)
+
                 except Exception as error:
                     log.exception("Scan failed for %s", symbol)
 
@@ -1562,6 +1728,7 @@ def background_worker():
                         existing = dict(state["symbols"].get(symbol, {}))
                         existing["symbol"] = symbol
                         existing["data_error"] = str(error)[:180]
+                        existing["updated"] = existing.get("updated")
                         state["symbols"][symbol] = existing
 
             risk_check()
@@ -1622,10 +1789,12 @@ def trade_statistics():
 
     realized = sum(pnls)
     fees = sum(number(t.get("fees")) for t in trades)
+
     gross_wins = sum(wins_list)
     gross_losses = abs(sum(losses_list))
 
     profit_factor = gross_wins / gross_losses if gross_losses else (gross_wins if gross_wins else 0)
+
     average_win = gross_wins / wins if wins else 0
     average_loss = gross_losses / losses if losses else 0
 
@@ -1658,7 +1827,7 @@ def trade_statistics():
 
 def learning_statistics():
     with lock:
-        learning = copy.deepcopy(state["learning"])
+        learning = state["learning"]
 
         return {
             "enabled": learning["enabled"],
@@ -1817,10 +1986,13 @@ Last error: <span id="error">None</span>
 <script>
 async function control(action){
  const message=document.getElementById('control');
+
  if(action==='stop'){
   if(!confirm('End trading? Existing positions remain monitored.'))return;
  }
+
  message.textContent='Sending command...';
+
  try{
   const response=await fetch('/control/'+action,{method:'POST'});
   const data=await response.json();
@@ -1830,11 +2002,13 @@ async function control(action){
   message.textContent='Could not contact bot.';
  }
 }
+
 document.addEventListener('keydown',function(e){
  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
  if(e.key.toLowerCase()==='c')control('stop');
  if(e.key.toLowerCase()==='v')control('start');
 });
+
 function money(x){return '$'+Number(x||0).toFixed(2);}
 function price(x){let n=Number(x||0);return n?n.toPrecision(8):'-';}
 function safe(x){
@@ -1844,6 +2018,7 @@ function safe(x){
 }
 function color(x){return x==='LONG'?'green':x==='SHORT'?'red':'yellow';}
 function pnlColor(x){return Number(x)>=0?'green':'red';}
+
 async function update(){
  try{
   let r=await fetch('/api/data',{cache:'no-store'});
@@ -1879,6 +2054,7 @@ async function update(){
   document.getElementById('drawdown').textContent=s.max_drawdown+'%';
 
   let learning=d.learning;
+
   document.getElementById('learnsamples').textContent=learning.samples+'/'+learning.minimum_samples+' minimum';
   document.getElementById('learnupdates').textContent=learning.updates;
   document.getElementById('learnresult').textContent=learning.last_result||'Waiting';
@@ -1897,7 +2073,9 @@ async function update(){
 
   document.getElementById('scanner').textContent=d.last_scan?'ACTIVE':'WAITING';
 
-  let rows='',details='';
+  let rows='';
+  let details='';
+
   for(let s of Object.values(d.symbols)){
    rows+=`<tr>
    <td>${safe(s.symbol)}</td><td>${price(s.price)}</td>
@@ -1930,6 +2108,7 @@ async function update(){
     <td>${money(p.margin)}</td><td>${price(p.take_profit)}</td>
     <td>${price(p.stop_loss)}</td></tr>`;
   }
+
   document.getElementById('positions').innerHTML=positionRows||'<tr><td colspan="8">No open positions</td></tr>';
 
   let historyRows='';
@@ -1942,12 +2121,14 @@ async function update(){
     <td class="${pnlColor(p.pnl)}">${money(p.pnl)}</td>
     <td>${safe(p.reason)}</td></tr>`;
   }
+
   document.getElementById('history').innerHTML=historyRows||'<tr><td colspan="9">No completed trades yet</td></tr>';
 
  }catch(e){
   document.getElementById('scanner').textContent='CONNECTION ERROR';
  }
 }
+
 update();
 setInterval(update,5000);
 </script>
@@ -1967,7 +2148,11 @@ def home():
 @app.route("/health")
 def health():
     start_worker_once()
-    return jsonify({"status": "ok", "version": VERSION, "paper_trading": True})
+    return jsonify({
+        "status": "ok",
+        "version": VERSION,
+        "paper_trading": True
+    })
 
 @app.route("/api/status")
 @app.route("/status")
@@ -1993,7 +2178,7 @@ def api_data():
     start_worker_once()
 
     with lock:
-        positions = copy.deepcopy(state["positions"])
+        positions = [dict(p) for p in state["positions"]]
         history = []
 
         for item in state["history"]:
@@ -2001,7 +2186,7 @@ def api_data():
             if trade:
                 history.append(trade)
 
-        symbols = copy.deepcopy(state["symbols"])
+        symbols = dict(state["symbols"])
         balance = number(state["balance"])
         daily_pnl = number(state["daily_pnl"])
         running = state["running"]
@@ -2016,4 +2201,82 @@ def api_data():
     totals = {
         "balance": round(balance, 4),
         "unrealized": round(unrealized, 4),
-    +#+#+#+#+#+
+        "equity": round(balance + unrealized, 4),
+        "available_balance": round(balance - used_margin, 4),
+        "used_margin": round(used_margin, 4)
+    }
+
+    return jsonify({
+        **totals,
+        "daily_pnl": round(daily_pnl + unrealized, 4),
+        "positions": positions,
+        "history": history[:100],
+        "symbols": symbols,
+        "running": running,
+        "last_scan": last_scan,
+        "private_status": private_status,
+        "account_balance": account_balance,
+        "last_error": last_error,
+        "stats": trade_statistics(),
+        "learning": learning_statistics()
+    })
+
+@app.route("/api/history")
+def api_history():
+    with lock:
+        history = [
+            trade for item in state["history"]
+            if (trade := clean_trade(item)) is not None
+        ]
+
+    return jsonify({
+        "count": len(history),
+        "history": history[:MAX_HISTORY],
+        "stats": trade_statistics()
+    })
+
+@app.route("/control/stop", methods=["POST"])
+@app.route("/control/end", methods=["POST"])
+def stop():
+    with lock:
+        state["running"] = False
+
+    save_state()
+
+    return jsonify({
+        "status": "stopped",
+        "message": "Trading stopped. Existing positions remain monitored."
+    })
+
+@app.route("/control/start", methods=["POST"])
+def start():
+    with lock:
+        if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
+            return jsonify({
+                "status": "blocked",
+                "error": "Daily loss limit reached"
+            }), 403
+
+        state["running"] = True
+
+    save_state()
+
+    return jsonify({
+        "status": "started",
+        "message": "Paper trading started"
+    })
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+load_state()
+recover_learning()
+
+if __name__ == "__main__":
+    start_worker_once()
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080))
+    )
