@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -7,64 +6,53 @@ import logging
 import math
 import uuid
 import hashlib
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, date
 
 from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-#BOT SENTRA TRADING BRAIN V16.3
-# BYBIT | RENDER | PAPER TRADING ONLY
-# HISTORY RECOVERY | LEARNING RECOVERY
-# 5m + 15m CONFIRMATION
-# 1h WEIGHTED - NOT MANDATORY
-# ATR STOPS | FASTER SCANNING | TRADE RECOVERY
-# ENTRY DIAGNOSTICS ADDED
+# COINSENTRA TRADING BRAIN V15.2
+# BYBIT | RENDER | SUPABASE | PAPER TRADING ONLY
+# 5-MINUTE STRATEGY | FIXED SL/TP | HISTORY RECOVERY
 # ============================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("BotSentraV16")
+log = logging.getLogger("CoinSentraV15")
 
 # ---------------- SETTINGS ----------------
 
-SYMBOLS = [
-    "ETHUSDT",
-    "XRPUSDT",
-    "SOLUSDT",
-    "SUIUSDT",
-    "ADAUSDT",
-    "NEARUSDT"
-]
+SYMBOLS = ["ETHUSDT", "XRPUSDT", "SOLUSDT", "SUIUSDT"]
 CATEGORY = "linear"
 
 LEVERAGE = 8
-MAX_POSITIONS = 3
+MAX_POSITIONS = 2
 DAILY_LOSS_LIMIT = 10
 
 START_BALANCE = 10000.0
 RISK_PER_TRADE = 3.0
 MAX_EQUITY_EXPOSURE = 0.10
 
-SCAN_SECONDS = 10
+SCAN_SECONDS = 30
 ENTRY_SCORE = 60
-STRONG_ENTRY_SCORE = 70
-CONFIRMATION_INTERVAL = "15"
-HIGHER_INTERVAL = "60"
 
-ATR_PERIOD = 14
-ATR_STOP_MULTIPLIER = 1.5
-MIN_STOP_PERCENT = 0.004
-MAX_STOP_PERCENT = 0.015
-REWARD_RISK = 1.8
+# ONLY 5-MINUTE MARKET CANDLES
+TRADING_INTERVAL = "5"
 
-COOLDOWN_SECONDS = 30
+# FIXED STOP LOSS / TAKE PROFIT
+STOP_LOSS_PERCENT = 0.015
+TAKE_PROFIT_PERCENT = 0.017
+
+COOLDOWN_SECONDS = 600
 
 FEE_RATE = 0.00055
 PAPER_TRADING = True
 
-VERSION = "16.3"
+VERSION = "15.2"
 MAX_HISTORY = 500
 
 # ---------------- ADAPTIVE LEARNING ----------------
@@ -89,15 +77,38 @@ DEFAULT_WEIGHTS = {name: 1.0 for name in LEARNING_FEATURES}
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
 STATE_FILE = os.path.join(DATA_DIR, "coinsentra_v15.json")
 
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+# API credentials (use newly rotated credentials)
+API_KEY = "YOUR_BYBIT_API_KEY"
+API_SECRET = "YOUR_BYBIT_API_SECRET"
+
+# SUPABASE
+SUPABASE_URL = "YOUR_SUPABASE_URL"
+SUPABASE_KEY = "YOUR_SUPABASE_KEY"
+
+# Environment variables override code placeholders
+API_KEY = os.getenv("BYBIT_API_KEY", API_KEY).strip()
+API_SECRET = os.getenv("BYBIT_API_SECRET", API_SECRET).strip()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", SUPABASE_URL).strip().rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", SUPABASE_KEY).strip()
+
+SUPABASE_ENABLED = (
+    SUPABASE_URL.startswith("https://")
+    and SUPABASE_KEY
+    and SUPABASE_KEY != "YOUR_SUPABASE_KEY"
+)
 
 # ---------------- BYBIT CONNECTION ----------------
 
 public_api = HTTP(testnet=False, timeout=15)
 private_api = None
 
-if API_KEY and API_SECRET:
+if (
+    API_KEY
+    and API_SECRET
+    and API_KEY != "YOUR_BYBIT_API_KEY"
+    and API_SECRET != "YOUR_BYBIT_API_SECRET"
+):
     private_api = HTTP(
         api_key=API_KEY,
         api_secret=API_SECRET,
@@ -178,6 +189,89 @@ def check_bybit_result(result):
 
 
 # ============================================================
+# SUPABASE STORAGE
+# ============================================================
+
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": "Bearer " + SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal"
+    }
+
+
+def supabase_save(snapshot):
+    if not SUPABASE_ENABLED:
+        return False
+
+    try:
+        payload = {
+            "id": "main",
+            "state": snapshot,
+            "updated_at": now_text()
+        }
+
+        url = SUPABASE_URL + "/rest/v1/coinsentra_state"
+
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, allow_nan=False).encode("utf-8"),
+            headers=supabase_headers(),
+            method="POST"
+        )
+
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+
+        log.info("SUPABASE STATE SAVED")
+        return True
+
+    except Exception:
+        log.exception("SUPABASE SAVE FAILED")
+        return False
+
+
+def supabase_load():
+    if not SUPABASE_ENABLED:
+        return None
+
+    try:
+        url = (
+            SUPABASE_URL
+            + "/rest/v1/coinsentra_state"
+            + "?select=state&id=eq.main&limit=1"
+        )
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": "Bearer " + SUPABASE_KEY,
+                "Accept": "application/json"
+            },
+            method="GET"
+        )
+
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        if isinstance(data, list) and data:
+            saved_state = data[0].get("state")
+
+            if isinstance(saved_state, dict):
+                log.info("SUPABASE STATE RECOVERED")
+                return saved_state
+
+        log.info("NO SUPABASE STATE FOUND")
+        return None
+
+    except Exception:
+        log.exception("SUPABASE LOAD FAILED")
+        return None
+
+
+# ============================================================
 # TRADE CLEANING AND STORAGE
 # ============================================================
 
@@ -246,9 +340,8 @@ def clean_trade(trade):
 
 def save_state():
     """
-    Atomic save.
-    Lock order: storage_lock, then lock.
-    Never call this while already holding lock.
+    Supabase primary storage.
+    Local JSON backup is retained as fallback.
     """
 
     try:
@@ -279,6 +372,9 @@ def save_state():
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
 
+            if SUPABASE_ENABLED:
+                supabase_save(snapshot)
+
         log.info(
             "STATE SAVED | positions=%s | history=%s",
             len(snapshot.get("positions", [])),
@@ -288,22 +384,30 @@ def save_state():
         return True
 
     except Exception:
-        log.exception("V16.3 state save failed")
+        log.exception("V15.2 state save failed")
         return False
 
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        log.info("New V16.3 paper account")
+    saved = None
+
+    # Supabase has priority.
+    if SUPABASE_ENABLED:
+        saved = supabase_load()
+
+    # Local backup fallback.
+    if saved is None and os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except Exception:
+            log.exception("Local state recovery failed")
+
+    if not isinstance(saved, dict):
+        log.info("New V15.2 paper account")
         return
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-
-        if not isinstance(saved, dict):
-            raise ValueError("Saved state is not a dictionary")
-
         with lock:
             for key in (
                 "balance", "positions", "history", "daily_pnl",
@@ -403,7 +507,6 @@ def load_state():
 
             for position in state["positions"]:
                 if not isinstance(position, dict):
-                    log.error("Invalid non-dictionary position")
                     continue
 
                 position.setdefault("trade_id", uuid.uuid4().hex)
@@ -422,28 +525,27 @@ def load_state():
                 side = position.get("side")
 
                 if entry > 0 and side in ("LONG", "SHORT"):
-                    stop_distance = number(
-                        position.get("stop_distance")
-                    )
+                    stop_distance = entry * STOP_LOSS_PERCENT
 
-                    if stop_distance <= 0:
-                        stop_distance = entry * MIN_STOP_PERCENT
-
-                    if number(position.get("stop_loss")) <= 0:
-                        position["stop_loss"] = (
-                            entry - stop_distance
-                            if side == "LONG"
-                            else entry + stop_distance
+                    if side == "LONG":
+                        position["stop_loss"] = entry * (
+                            1 - STOP_LOSS_PERCENT
                         )
-
-                    if number(position.get("take_profit")) <= 0:
-                        position["take_profit"] = (
-                            entry + stop_distance * REWARD_RISK
-                            if side == "LONG"
-                            else entry - stop_distance * REWARD_RISK
+                        position["take_profit"] = entry * (
+                            1 + TAKE_PROFIT_PERCENT
+                        )
+                    else:
+                        position["stop_loss"] = entry * (
+                            1 + STOP_LOSS_PERCENT
+                        )
+                        position["take_profit"] = entry * (
+                            1 - TAKE_PROFIT_PERCENT
                         )
 
                     position["stop_distance"] = stop_distance
+                    position["reward_risk"] = (
+                        TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT
+                    )
 
                 if (
                     entry <= 0
@@ -454,10 +556,6 @@ def load_state():
                     position["state_error"] = (
                         "Invalid saved position values - preserved"
                     )
-                    log.error(
-                        "POSITION RECOVERY WARNING | %s",
-                        position.get("trade_id")
-                    )
                 else:
                     position.pop("state_error", None)
 
@@ -467,7 +565,7 @@ def load_state():
             state["version"] = VERSION
 
         log.info(
-            "V16.3 RESTORED | positions=%s | completed=%s",
+            "V15.2 RESTORED | positions=%s | completed=%s",
             len(state["positions"]),
             len(state["history"])
         )
@@ -475,7 +573,7 @@ def load_state():
         save_state()
 
     except Exception:
-        log.exception("V16.3 state loading failed")
+        log.exception("V15.2 state loading failed")
 
 
 def reset_daily():
@@ -533,7 +631,6 @@ def update_learning(trade):
 
     with lock:
         learning = state["learning"]
-
         processed = learning.get("processed_trade_ids", [])
 
         if not isinstance(processed, list):
@@ -644,10 +741,7 @@ def update_learning(trade):
         learning["last_update"] = now_text()
 
     if not save_state():
-        log.error(
-            "LEARNING SAVE FAILED | trade=%s",
-            trade_id
-        )
+        log.error("LEARNING SAVE FAILED | trade=%s", trade_id)
 
 
 def recover_learning():
@@ -730,12 +824,12 @@ def get_price(symbol):
     return price
 
 
-def get_candles(symbol, interval, limit=200):
+def get_candles(symbol, interval="5", limit=200):
     result = check_bybit_result(
         public_api.get_kline(
             category=CATEGORY,
             symbol=symbol,
-            interval=interval,
+            interval="5",
             limit=limit
         )
     )
@@ -764,6 +858,7 @@ def get_candles(symbol, interval, limit=200):
     if len(candles) < 60:
         raise ValueError("Insufficient candle history: " + symbol)
 
+    # Exclude the currently forming candle.
     candles = candles[:-1]
 
     if len(candles) < 55:
@@ -922,7 +1017,7 @@ def bollinger(values, period=20):
     )
 
 
-def atr(candles, period=ATR_PERIOD):
+def atr(candles, period=14):
     if len(candles) < period + 1:
         return 0.0
 
@@ -1042,7 +1137,7 @@ def analyze_candles(candles):
 
 
 # ============================================================
-# V16.3 SIGNAL ENGINE
+# 5-MINUTE SIGNAL ENGINE
 # ============================================================
 
 def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
@@ -1104,25 +1199,21 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
-    if fifteen["ema9"] > fifteen["ema21"]:
+    # Confirmation is derived from the same 5-minute candles.
+    if five["ema9"] > five["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
 
-    elif fifteen["ema9"] < fifteen["ema21"]:
+    elif five["ema9"] < five["ema21"]:
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    if (
-        hourly["ema9"] > hourly["ema21"]
-        and hourly["ema21"] > hourly["ema50"]
-    ):
+    # Higher-timeframe feature repurposed as 5m trend strength.
+    if five["ema9"] > five["ema21"] and five["ema21"] > five["ema50"]:
         features["higher_timeframe"] = 1
         long_score += 20 * weights["higher_timeframe"]
 
-    elif (
-        hourly["ema9"] < hourly["ema21"]
-        and hourly["ema21"] < hourly["ema50"]
-    ):
+    elif five["ema9"] < five["ema21"] and five["ema21"] < five["ema50"]:
         features["higher_timeframe"] = -1
         short_score += 20 * weights["higher_timeframe"]
 
@@ -1156,97 +1247,45 @@ def calculate_signal(five, fifteen, hourly, imbalance, funding, oi_change):
     short_score = min(100, round(short_score))
 
     signal = "WAIT"
-    entry_reason = "Waiting for a valid setup"
 
     long_confirmed = (
         five["ema9"] > five["ema21"]
         and five["ema21"] > five["ema50"]
-        and fifteen["ema9"] > fifteen["ema21"]
         and five["rsi"] >= 50
         and five["rsi"] <= 68
         and five["adx"] >= 18
         and five["volume_ratio"] >= 1.15
-        and five["price"] > five["ema21"]
     )
 
     short_confirmed = (
         five["ema9"] < five["ema21"]
         and five["ema21"] < five["ema50"]
-        and fifteen["ema9"] < fifteen["ema21"]
         and five["rsi"] >= 32
         and five["rsi"] <= 50
         and five["adx"] >= 18
         and five["volume_ratio"] >= 1.15
-        and five["price"] < five["ema21"]
     )
 
-    if long_score >= ENTRY_SCORE and long_confirmed:
+    if (
+        long_score >= ENTRY_SCORE
+        and long_score - short_score >= 15
+        and long_confirmed
+        and five["price"] > five["ema21"]
+    ):
         signal = "LONG"
-        entry_reason = "LONG READY - 5m and 15m confirmed"
 
-    elif short_score >= ENTRY_SCORE and short_confirmed:
+    elif (
+        short_score >= ENTRY_SCORE
+        and short_score - long_score >= 15
+        and short_confirmed
+        and five["price"] < five["ema21"]
+    ):
         signal = "SHORT"
-        entry_reason = "SHORT READY - 5m and 15m confirmed"
-
-    else:
-        best_score = max(long_score, short_score)
-
-        if best_score < ENTRY_SCORE:
-            entry_reason = (
-                "Score below entry threshold: "
-                + str(ENTRY_SCORE)
-            )
-
-        elif five["adx"] < 18:
-            entry_reason = "Waiting for ADX >= 18"
-
-        elif five["volume_ratio"] < 1.15:
-            entry_reason = "Waiting for volume confirmation"
-
-        elif long_score >= short_score:
-            if not (
-                five["ema9"] > five["ema21"]
-                and five["ema21"] > five["ema50"]
-            ):
-                entry_reason = "Waiting for bullish 5m trend"
-            elif not (
-                fifteen["ema9"] > fifteen["ema21"]
-            ):
-                entry_reason = "Waiting for bullish 15m confirmation"
-            elif not 50 <= five["rsi"] <= 68:
-                entry_reason = "Waiting for bullish RSI confirmation"
-            elif five["price"] <= five["ema21"]:
-                entry_reason = "Price below 5m EMA21"
-            else:
-                entry_reason = "Waiting for LONG setup"
-
-        else:
-            if not (
-                five["ema9"] < five["ema21"]
-                and five["ema21"] < five["ema50"]
-            ):
-                entry_reason = "Waiting for bearish 5m trend"
-            elif not (
-                fifteen["ema9"] < fifteen["ema21"]
-            ):
-                entry_reason = "Waiting for bearish 15m confirmation"
-            elif not 32 <= five["rsi"] <= 50:
-                entry_reason = "Waiting for bearish RSI confirmation"
-            elif five["price"] >= five["ema21"]:
-                entry_reason = "Price above 5m EMA21"
-            else:
-                entry_reason = "Waiting for SHORT setup"
-
-    strong_signal = (
-        max(long_score, short_score) >= STRONG_ENTRY_SCORE
-    )
 
     return {
         "long_score": long_score,
         "short_score": short_score,
         "signal": signal,
-        "strong_signal": strong_signal,
-        "entry_reason": entry_reason,
         "features": features
     }
 
@@ -1319,100 +1358,6 @@ def symbol_in_cooldown(symbol):
 
 
 # ============================================================
-# ENTRY DIAGNOSTICS - NEW
-# Explains why a valid signal did not open a paper trade.
-# Does not change the signal score or entry strategy.
-# ============================================================
-
-def diagnose_entry(symbol, side, price, atr_value):
-    if not PAPER_TRADING:
-        return "BLOCKED", "Paper trading is disabled"
-
-    if side not in ("LONG", "SHORT"):
-        return "BLOCKED", "No valid LONG or SHORT signal"
-
-    if price <= 0:
-        return "BLOCKED", "Invalid entry price"
-
-    if atr_value <= 0:
-        return "BLOCKED", "ATR is zero or unavailable"
-
-    with lock:
-        if not state["running"]:
-            return "BLOCKED", "Trading is stopped - press START TRADING"
-
-        if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
-            return "BLOCKED", "Daily loss limit reached"
-
-        if len(state["positions"]) >= MAX_POSITIONS:
-            return "BLOCKED", (
-                "Maximum open positions reached: "
-                + str(MAX_POSITIONS)
-            )
-
-        if any(
-            p.get("symbol") == symbol
-            for p in state["positions"]
-        ):
-            return "BLOCKED", "A position is already open for this coin"
-
-        balance = number(state["balance"])
-
-        if balance <= 0:
-            return "BLOCKED", "Paper account balance is zero or negative"
-
-        closed_at = number(
-            state["last_closed_by_symbol"].get(symbol)
-        )
-
-    if closed_at > 0:
-        remaining = COOLDOWN_SECONDS - (time.time() - closed_at)
-
-        if remaining > 0:
-            return "BLOCKED", (
-                "Symbol cooldown active: "
-                + str(int(math.ceil(remaining)))
-                + " seconds remaining"
-            )
-
-    raw_stop = atr_value * ATR_STOP_MULTIPLIER
-    minimum_stop = price * MIN_STOP_PERCENT
-    maximum_stop = price * MAX_STOP_PERCENT
-    stop_distance = max(raw_stop, minimum_stop)
-
-    if stop_distance > maximum_stop:
-        stop_percent = (stop_distance / price) * 100
-        max_percent = MAX_STOP_PERCENT * 100
-
-        return "BLOCKED", (
-            "ATR stop too wide: "
-            + str(round(stop_percent, 3))
-            + "%; maximum allowed is "
-            + str(round(max_percent, 3))
-            + "%"
-        )
-
-    risk_amount = min(RISK_PER_TRADE, balance * 0.005)
-    quantity = risk_amount / stop_distance
-
-    max_notional = balance * MAX_EQUITY_EXPOSURE
-    quantity = min(quantity, max_notional / price)
-
-    if quantity <= 0:
-        return "BLOCKED", "Calculated paper position quantity is zero"
-
-    notional = quantity * price
-    margin = notional / LEVERAGE
-
-    if margin > balance:
-        return "BLOCKED", "Required margin exceeds paper account balance"
-
-    return "READY", (
-        "Entry checks passed - attempting to open paper position"
-    )
-
-
-# ============================================================
 # OPEN PAPER POSITION
 # ============================================================
 
@@ -1420,7 +1365,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
     if not PAPER_TRADING or side not in ("LONG", "SHORT"):
         return False
 
-    if price <= 0 or atr_value <= 0:
+    if price <= 0:
         return False
 
     if symbol_in_cooldown(symbol):
@@ -1432,19 +1377,16 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             return False
 
         if len(state["positions"]) >= MAX_POSITIONS:
-            log.info("MAX POSITIONS REACHED | %s", symbol)
             return False
 
         if any(
             p.get("symbol") == symbol
             for p in state["positions"]
         ):
-            log.info("POSITION ALREADY OPEN | %s", symbol)
             return False
 
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
             state["running"] = False
-            log.warning("DAILY LOSS LIMIT REACHED")
             return False
 
         balance = number(state["balance"])
@@ -1452,19 +1394,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
         if balance <= 0:
             return False
 
-        raw_stop = atr_value * ATR_STOP_MULTIPLIER
-        minimum_stop = price * MIN_STOP_PERCENT
-        maximum_stop = price * MAX_STOP_PERCENT
-
-        stop_distance = max(raw_stop, minimum_stop)
-
-        if stop_distance > maximum_stop:
-            log.info(
-                "ENTRY SKIPPED | %s | ATR stop too wide",
-                symbol
-            )
-            return False
-
+        stop_distance = price * STOP_LOSS_PERCENT
         risk_amount = min(
             RISK_PER_TRADE,
             balance * 0.005
@@ -1485,11 +1415,11 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             return False
 
         if side == "LONG":
-            stop_price = price - stop_distance
-            target_price = price + stop_distance * REWARD_RISK
+            stop_price = price * (1 - STOP_LOSS_PERCENT)
+            target_price = price * (1 + TAKE_PROFIT_PERCENT)
         else:
-            stop_price = price + stop_distance
-            target_price = price - stop_distance * REWARD_RISK
+            stop_price = price * (1 + STOP_LOSS_PERCENT)
+            target_price = price * (1 - TAKE_PROFIT_PERCENT)
 
         position = {
             "trade_id": uuid.uuid4().hex,
@@ -1505,7 +1435,7 @@ def open_paper_position(symbol, side, price, features=None, atr_value=0.0):
             "stop_loss": stop_price,
             "stop_distance": stop_distance,
             "risk_amount": quantity * stop_distance,
-            "reward_risk": REWARD_RISK,
+            "reward_risk": TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT,
             "opened": now_text(),
             "unrealized_pnl": 0.0,
             "gross_unrealized_pnl": 0.0,
@@ -1835,24 +1765,13 @@ def check_private_account():
 
 
 # ============================================================
-# SCANNER
+# SCANNER - 5 MINUTES ONLY
 # ============================================================
 
 def scan_symbol(symbol):
-    five_candles = get_candles(symbol, "5", 200)
+    candles = get_candles(symbol, TRADING_INTERVAL, 200)
 
-    fifteen_candles = get_candles(
-        symbol, CONFIRMATION_INTERVAL, 120
-    )
-
-    hourly_candles = get_candles(
-        symbol, HIGHER_INTERVAL, 120
-    )
-
-    five = analyze_candles(five_candles)
-    fifteen = analyze_candles(fifteen_candles)
-    hourly = analyze_candles(hourly_candles)
-
+    five = analyze_candles(candles)
     five["price"] = get_price(symbol)
 
     imbalance = get_orderbook(symbol)
@@ -1861,11 +1780,21 @@ def scan_symbol(symbol):
 
     signal = calculate_signal(
         five,
-        fifteen,
-        hourly,
+        five,
+        five,
         imbalance,
         funding,
         oi_change
+    )
+
+    trend = (
+        "BULLISH"
+        if five["ema9"] > five["ema21"]
+        and five["ema21"] > five["ema50"]
+        else "BEARISH"
+        if five["ema9"] < five["ema21"]
+        and five["ema21"] < five["ema50"]
+        else "MIXED"
     )
 
     data = {
@@ -1882,19 +1811,9 @@ def scan_symbol(symbol):
         "orderbook_imbalance": round(imbalance, 3),
         "funding": funding,
         "oi_change": round(oi_change, 3),
-        "hourly_trend": (
-            "BULLISH"
-            if hourly["ema9"] > hourly["ema21"]
-            and hourly["ema21"] > hourly["ema50"]
-            else "BEARISH"
-            if hourly["ema9"] < hourly["ema21"]
-            and hourly["ema21"] < hourly["ema50"]
-            else "MIXED"
-        ),
+        "hourly_trend": trend,
         **signal,
-        "updated": now_text(),
-        "entry_status": "WAITING",
-        "entry_diagnostic": signal["entry_reason"]
+        "updated": now_text()
     }
 
     with lock:
@@ -1905,64 +1824,14 @@ def scan_symbol(symbol):
             and signal["signal"] in ("LONG", "SHORT")
         )
 
-    if not should_open:
-        if signal["signal"] in ("LONG", "SHORT"):
-            status, diagnostic = diagnose_entry(
-                symbol,
-                signal["signal"],
-                five["price"],
-                five["atr"]
-            )
-            data["entry_status"] = status
-            data["entry_diagnostic"] = diagnostic
-        else:
-            data["entry_status"] = "WAITING"
-            data["entry_diagnostic"] = signal["entry_reason"]
-
-        with lock:
-            state["symbols"][symbol] = data
-
-        return data
-
-    status, diagnostic = diagnose_entry(
-        symbol,
-        signal["signal"],
-        five["price"],
-        five["atr"]
-    )
-
-    data["entry_status"] = status
-    data["entry_diagnostic"] = diagnostic
-
-    if status == "READY":
-        opened = open_paper_position(
+    if should_open:
+        open_paper_position(
             symbol,
             signal["signal"],
             five["price"],
             signal["features"],
             five["atr"]
         )
-
-        if opened:
-            data["entry_status"] = "OPENED"
-            data["entry_diagnostic"] = (
-                "Paper position opened successfully"
-            )
-        else:
-            data["entry_status"] = "BLOCKED"
-            data["entry_diagnostic"] = (
-                "Pre-check passed, but position opening failed. "
-                "Check Render logs for the exact reason."
-            )
-
-            log.warning(
-                "ENTRY OPEN FAILED | %s | %s",
-                symbol,
-                signal["signal"]
-            )
-
-    with lock:
-        state["symbols"][symbol] = data
 
     return data
 
@@ -1972,7 +1841,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.3 worker started")
+    log.info("CoinSentra V15.2 worker started")
     last_private_check = 0.0
 
     while True:
@@ -1992,10 +1861,6 @@ def background_worker():
                     with lock:
                         existing = state["symbols"].get(symbol, {})
                         existing["data_error"] = str(e)[:180]
-                        existing["entry_status"] = "SCAN ERROR"
-                        existing["entry_diagnostic"] = (
-                            "Market scan failed: " + str(e)[:180]
-                        )
                         existing["symbol"] = symbol
                         state["symbols"][symbol] = existing
 
@@ -2033,7 +1898,7 @@ def start_worker_once():
 
         thread = threading.Thread(
             target=background_worker,
-            name="CoinSentraV16Worker",
+            name="CoinSentraV15Worker",
             daemon=True
         )
 
@@ -2140,7 +2005,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.3</title>
+<title>CoinSentra Trading Brain V15.2</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -2170,7 +2035,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.3 | BYBIT | PAPER MODE ONLY</div>
+<div class="small">TRADING BRAIN V15.2 | BYBIT | PAPER MODE ONLY | 5M ONLY</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2227,17 +2092,16 @@ th{color:#9bb0ce}
 <div class="card">
 <h2>MARKET SCANNER</h2>
 <div id="scanner" class="small">WAITING FOR MARKET DATA</div>
-<div class="small">Entry threshold: 60 | Strong signal: 70+</div>
 <div class="scroll">
 <table>
-<thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>1H TREND</th></tr></thead>
+<thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>5M TREND</th></tr></thead>
 <tbody id="markets"></tbody>
 </table>
 </div>
 </div>
 
 <div class="card">
-<h2>INDICATORS AND ENTRY STATUS</h2>
+<h2>INDICATORS (5M)</h2>
 <div id="indicators" class="small">Waiting for market data...</div>
 </div>
 
@@ -2263,11 +2127,10 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.3 | 5m + 15m entry confirmation<br>
-1h trend contributes to score but is not mandatory<br>
-Entry score 60 | Strong signal 70+<br>
-ATR stop | 1.8:1 target/risk | 60-second re-entry cooldown<br>
-Paper trading only | Fee estimate 0.055% per side<br>
+Version 15.2 | 5-minute candles only<br>
+Fixed stop loss 1.5% | Fixed take profit 1.7%<br>
+10-minute re-entry cooldown | Paper trading only<br>
+Fee estimate 0.055% per side<br>
 Last scan: <span id="last">Waiting</span><br>
 Last error: <span id="error">None</span>
 </div>
@@ -2382,11 +2245,7 @@ async function update(){
    Volume ${s.volume_ratio??'-'}x |
    Orderbook ${s.orderbook_imbalance??'-'} |
    Funding ${s.funding??'-'} |
-   OI ${s.oi_change??'-'}%<br>
-   <b>Entry status:</b> ${safe(s.entry_status||'WAITING')}<br>
-   <b>Why:</b> ${safe(s.entry_diagnostic||s.entry_reason||'Waiting for scan')}<br>
-   <b>Signal reason:</b> ${safe(s.entry_reason||'Waiting')}<br>
-   <b>Strong signal:</b> ${s.strong_signal?'YES (70+)':'NO'}
+   OI ${s.oi_change??'-'}%
    ${s.data_error?' | ERROR: '+safe(s.data_error):''}</p>`;
   }
 
