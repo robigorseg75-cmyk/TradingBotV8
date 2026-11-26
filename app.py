@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -1130,11 +1129,15 @@ def calculate_signal(
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
-    if 48 <= five["rsi"] <= 70:
+    # UPDATED RSI SCORING:
+    # LONG: RSI 50-75
+    # SHORT: RSI 25-40
+
+    if 50 <= five["rsi"] <= 75:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
 
-    elif 30 <= five["rsi"] <= 52:
+    elif 25 <= five["rsi"] <= 40:
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
@@ -1224,16 +1227,18 @@ def calculate_signal(
 
     signal = "WAIT"
 
+    # UPDATED LONG CONFIRMATION RSI RANGE: 50-75
     long_confirmed = (
-        48 <= five["rsi"] <= 70
+        50 <= five["rsi"] <= 75
         and five["ema9"] > five["ema21"]
         and five["ema21"] > five["ema50"]
         and five["adx"] >= 16
         and five["volume_ratio"] >= 1.0
     )
 
+    # UPDATED SHORT CONFIRMATION RSI RANGE: 25-40
     short_confirmed = (
-        30 <= five["rsi"] <= 52
+        25 <= five["rsi"] <= 40
         and five["ema9"] < five["ema21"]
         and five["ema21"] < five["ema50"]
         and five["adx"] >= 16
