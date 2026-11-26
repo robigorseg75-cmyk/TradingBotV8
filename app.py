@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -12,19 +13,16 @@ from flask import Flask, jsonify, render_template_string
 from pybit.unified_trading import HTTP
 
 # ============================================================
-# COINSENTRA TRADING BRAIN V16.7
+# COINSENTRA TRADING BRAIN V16.8
 # BYBIT | RENDER | LOCAL JSON | PAPER TRADING | 5M ONLY
+# WILDER RSI + CLOSED CANDLE VALIDATION
 # ============================================================
 
-VERSION = "16.7"
+VERSION = "16.8"
 
 SYMBOLS = [
-    "ETHUSDT",
-    "XRPUSDT",
-    "SOLUSDT",
-    "SUIUSDT",
-    "ADAUSDT",
-    "NEARUSDT"
+    "ETHUSDT", "XRPUSDT", "SOLUSDT",
+    "SUIUSDT", "ADAUSDT", "NEARUSDT"
 ]
 
 CATEGORY = "linear"
@@ -48,16 +46,9 @@ PAPER_TRADING = True
 MAX_HISTORY = 500
 
 LEARNING_FEATURES = [
-    "trend_fast",
-    "trend_slow",
-    "rsi",
-    "macd",
-    "volume",
-    "orderbook",
-    "confirmation",
-    "trend_alignment",
-    "adx",
-    "funding",
+    "trend_fast", "trend_slow", "rsi", "macd",
+    "volume", "orderbook", "confirmation",
+    "trend_alignment", "adx", "funding",
     "open_interest"
 ]
 
@@ -88,7 +79,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 log = logging.getLogger("CoinSentra")
 
 # ============================================================
@@ -105,11 +95,7 @@ worker_started = False
 # BYBIT
 # ============================================================
 
-public_api = HTTP(
-    testnet=False,
-    timeout=15
-)
-
+public_api = HTTP(testnet=False, timeout=15)
 private_api = None
 
 if BYBIT_API_KEY and BYBIT_API_SECRET:
@@ -150,9 +136,7 @@ def check_bybit_result(result):
         raise RuntimeError("Invalid Bybit response")
 
     if result.get("retCode", 0) != 0:
-        raise RuntimeError(
-            result.get("retMsg", "Bybit API error")
-        )
+        raise RuntimeError(result.get("retMsg", "Bybit API error"))
 
     return result
 
@@ -200,10 +184,6 @@ state = {
 }
 
 
-# ============================================================
-# STATE SNAPSHOT
-# ============================================================
-
 def state_snapshot():
     with lock:
         snapshot = {
@@ -228,20 +208,18 @@ def state_snapshot():
 
 
 # ============================================================
-# SAVE STATE - LOCAL JSON ONLY
+# SAVE STATE
 # ============================================================
 
 def save_state():
     try:
         snapshot = state_snapshot()
-
         os.makedirs(DATA_DIR, exist_ok=True)
         temporary = STATE_FILE + ".tmp"
 
         with open(temporary, "w", encoding="utf-8") as file:
             json.dump(
-                snapshot,
-                file,
+                snapshot, file,
                 ensure_ascii=False,
                 allow_nan=False
             )
@@ -253,13 +231,11 @@ def save_state():
 
     except Exception:
         log.exception("Local JSON state save failed")
-
         try:
             if os.path.exists(STATE_FILE + ".tmp"):
                 os.remove(STATE_FILE + ".tmp")
         except Exception:
             pass
-
         return False
 
 
@@ -271,11 +247,9 @@ def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as file:
             loaded = json.load(file)
-
     except FileNotFoundError:
         log.warning("No saved JSON state found. Starting new state.")
         return
-
     except Exception:
         log.exception("Could not load JSON state")
         return
@@ -286,15 +260,12 @@ def load_state():
 
     with lock:
         state["balance"] = number(
-            loaded.get("balance"),
-            START_BALANCE
+            loaded.get("balance"), START_BALANCE
         )
-
         state["positions"] = [
             p for p in loaded.get("positions", [])
             if isinstance(p, dict)
         ]
-
         state["history"] = [
             t for t in loaded.get("history", [])
             if isinstance(t, dict)
@@ -302,27 +273,20 @@ def load_state():
 
         state["daily_pnl"] = number(loaded.get("daily_pnl"))
         state["daily_date"] = loaded.get(
-            "daily_date",
-            str(date.today())
+            "daily_date", str(date.today())
         )
-
         state["running"] = bool(loaded.get("running", True))
         state["last_scan"] = loaded.get("last_scan")
         state["last_error"] = loaded.get("last_error")
-
         state["private_status"] = loaded.get(
-            "private_status",
-            "NOT CONFIGURED"
+            "private_status", "NOT CONFIGURED"
         )
-
         state["account_balance"] = loaded.get("account_balance")
 
         symbols = loaded.get("symbols", {})
         state["symbols"] = symbols if isinstance(symbols, dict) else {}
 
-        state["scan_count"] = int(
-            number(loaded.get("scan_count"))
-        )
+        state["scan_count"] = int(number(loaded.get("scan_count")))
 
         closed = loaded.get("last_closed_by_symbol", {})
         state["last_closed_by_symbol"] = (
@@ -332,7 +296,6 @@ def load_state():
         state["version"] = VERSION
 
         learning = loaded.get("learning", default_learning())
-
         if not isinstance(learning, dict):
             learning = default_learning()
 
@@ -351,12 +314,10 @@ def load_state():
                 if key == "trend_alignment"
                 else key
             )
-
             merged["weights"][key] = clamp(
                 number(
                     old_weights.get(
-                        key,
-                        old_weights.get(old_key, 1.0)
+                        key, old_weights.get(old_key, 1.0)
                     ),
                     1.0
                 ),
@@ -373,7 +334,6 @@ def load_state():
         merged["updates"] = max(
             0, int(number(merged.get("updates")))
         )
-
         state["learning"] = merged
 
         valid_positions = []
@@ -383,8 +343,7 @@ def load_state():
             position["quantity"] = number(position.get("quantity"))
             position["margin"] = number(position.get("margin"))
             position["leverage"] = number(
-                position.get("leverage"),
-                LEVERAGE
+                position.get("leverage"), LEVERAGE
             )
             position["unrealized_pnl"] = number(
                 position.get("unrealized_pnl")
@@ -461,7 +420,6 @@ def get_learning_weights():
 
 def learning_snapshot_for_side(features, side):
     direction = 1 if side == "LONG" else -1
-
     return {
         name: number(features.get(name)) * direction
         for name in LEARNING_FEATURES
@@ -479,9 +437,7 @@ def clean_trade(trade):
     if trade.get("status") != "COMPLETED":
         return None
 
-    required = ["entry", "exit", "quantity", "pnl"]
-
-    for key in required:
+    for key in ["entry", "exit", "quantity", "pnl"]:
         if key not in trade:
             return None
 
@@ -493,14 +449,12 @@ def clean_trade(trade):
         return None
 
     result = dict(trade)
-
     result["entry"] = entry
     result["exit"] = exit_price
     result["quantity"] = quantity
     result["pnl"] = number(trade.get("pnl"))
     result["net_pnl"] = number(
-        trade.get("net_pnl"),
-        result["pnl"]
+        trade.get("net_pnl"), result["pnl"]
     )
     result["gross_pnl"] = number(trade.get("gross_pnl"))
     result["fees"] = number(trade.get("fees"))
@@ -508,7 +462,6 @@ def clean_trade(trade):
         trade.get("trade_id") or uuid.uuid4().hex
     )
     result["status"] = "COMPLETED"
-
     return result
 
 
@@ -518,7 +471,6 @@ def clean_trade(trade):
 
 def update_learning(trade):
     trade = clean_trade(trade)
-
     if trade is None:
         return
 
@@ -538,12 +490,10 @@ def update_learning(trade):
 
         for name in LEARNING_FEATURES:
             value = number(snapshot.get(name))
-
             if value == 0:
                 continue
 
             adjustment = LEARNING_RATE * outcome * value
-
             learning["weights"][name] = clamp(
                 learning["weights"][name] + adjustment,
                 LEARNING_MIN_WEIGHT,
@@ -575,18 +525,15 @@ def recover_learning():
 def get_price(symbol):
     result = check_bybit_result(
         public_api.get_tickers(
-            category=CATEGORY,
-            symbol=symbol
+            category=CATEGORY, symbol=symbol
         )
     )
 
     data = result.get("result", {}).get("list", [])
-
     if not data:
         raise RuntimeError("No ticker returned")
 
     price_value = number(data[0].get("lastPrice"))
-
     if price_value <= 0:
         raise RuntimeError("Invalid price")
 
@@ -606,6 +553,8 @@ def get_candles(symbol, interval=CANDLE_INTERVAL, limit=200):
     raw = result.get("result", {}).get("list", [])
     candles = []
 
+    # Bybit returns newest candles first.
+    # Reverse to chronological order.
     for row in reversed(raw):
         if len(row) < 6:
             continue
@@ -626,14 +575,21 @@ def get_candles(symbol, interval=CANDLE_INTERVAL, limit=200):
             candles.append(candle)
 
     if len(candles) < 61:
-        raise RuntimeError("Insufficient completed candles")
+        raise RuntimeError("Insufficient candles received")
 
-    completed = candles[:-1]
+    # Explicitly remove any candle that has not closed yet.
+    interval_ms = int(interval) * 60 * 1000
+    current_time_ms = int(time.time() * 1000)
+
+    completed = [
+        candle for candle in candles
+        if candle["time"] + interval_ms <= current_time_ms
+    ]
 
     if len(completed) < 60:
-        raise RuntimeError("Insufficient completed candles")
+        raise RuntimeError("Insufficient completed 5-minute candles")
 
-    return completed
+    return completed[-limit:]
 
 
 def get_orderbook(symbol):
@@ -652,7 +608,6 @@ def get_orderbook(symbol):
 
         bid_volume = sum(number(x[1]) for x in bids)
         ask_volume = sum(number(x[1]) for x in asks)
-
         total = bid_volume + ask_volume
 
         if total <= 0:
@@ -669,13 +624,11 @@ def get_funding(symbol):
     try:
         result = check_bybit_result(
             public_api.get_tickers(
-                category=CATEGORY,
-                symbol=symbol
+                category=CATEGORY, symbol=symbol
             )
         )
 
         data = result.get("result", {}).get("list", [])
-
         if data:
             return number(data[0].get("fundingRate"))
 
@@ -731,7 +684,15 @@ def ema(values, period):
 
 
 def rsi(values, period=14):
-    if len(values) < period + 1:
+    """
+    Wilder's RSI.
+
+    Uses the first 'period' price changes to seed average gain/loss,
+    then applies Wilder smoothing to every subsequent price change.
+    This is the standard RSI calculation used by most charting platforms.
+    """
+
+    if period <= 0 or len(values) < period + 1:
         return 50.0
 
     gains = []
@@ -739,34 +700,47 @@ def rsi(values, period=14):
 
     for i in range(1, len(values)):
         change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    # Initial averages: simple average of first 14 changes.
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    if avg_loss <= 0:
+    # Wilder smoothing for all remaining changes.
+    for i in range(period, len(gains)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
+    if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
 
+    if avg_gain == 0:
+        return 0.0
+
     rs = avg_gain / avg_loss
-    return 100 - 100 / (1 + rs)
+    result = 100.0 - (100.0 / (1.0 + rs))
+
+    return clamp(result, 0.0, 100.0)
 
 
 def macd(values):
     if len(values) < 26:
         return 0.0
-
     return ema(values, 12) - ema(values, 26)
 
 
 def bollinger(values, period=20, multiplier=2):
     subset = values[-period:]
-
     if not subset:
         return 0.0, 0.0, 0.0
 
     middle = sum(subset) / len(subset)
-
     variance = sum(
         (x - middle) ** 2 for x in subset
     ) / len(subset)
@@ -795,7 +769,6 @@ def atr(candles, period=14):
             abs(current["high"] - previous["close"]),
             abs(current["low"] - previous["close"])
         )
-
         ranges.append(tr)
 
     return sum(ranges[-period:]) / period
@@ -819,7 +792,6 @@ def adx_approx(candles, period=14):
         plus_values.append(
             up_move if up_move > down_move and up_move > 0 else 0
         )
-
         minus_values.append(
             down_move if down_move > up_move and down_move > 0 else 0
         )
@@ -829,24 +801,20 @@ def adx_approx(candles, period=14):
             abs(current["high"] - previous["close"]),
             abs(current["low"] - previous["close"])
         )
-
         tr_values.append(tr)
 
     tr_avg = sum(tr_values[-period:]) / period
-
     if tr_avg <= 0:
         return 0.0
 
     plus_di = (
         sum(plus_values[-period:]) / period / tr_avg * 100
     )
-
     minus_di = (
         sum(minus_values[-period:]) / period / tr_avg * 100
     )
 
     total = plus_di + minus_di
-
     if total <= 0:
         return 0.0
 
@@ -906,8 +874,7 @@ def detect_candlestick_patterns(candles):
     body2 = p2["body"]
 
     if (
-        p2["bearish"]
-        and p1["bullish"]
+        p2["bearish"] and p1["bullish"]
         and c1["open"] <= c2["close"]
         and c1["close"] >= c2["open"]
         and body1 >= body2 * 1.05
@@ -923,8 +890,7 @@ def detect_candlestick_patterns(candles):
         result["bullish"].append("Hammer")
 
     if (
-        p3["bearish"]
-        and p3["body_ratio"] > 0.5
+        p3["bearish"] and p3["body_ratio"] > 0.5
         and p2["body_ratio"] < 0.35
         and p1["bullish"]
         and c1["close"] > (c3["open"] + c3["close"]) / 2
@@ -933,15 +899,12 @@ def detect_candlestick_patterns(candles):
 
     if len(candles) >= 4:
         a, b, c, d = candles[-4:]
-
         pb = candle_parts(b)
         pc = candle_parts(c)
         pd = candle_parts(d)
 
         if (
-            pb["bullish"]
-            and pc["bullish"]
-            and pd["bullish"]
+            pb["bullish"] and pc["bullish"] and pd["bullish"]
             and b["close"] > a["close"]
             and c["close"] > b["close"]
             and d["close"] > c["close"]
@@ -952,8 +915,7 @@ def detect_candlestick_patterns(candles):
             result["bullish"].append("Three White Soldiers")
 
     if (
-        p2["bullish"]
-        and p1["bearish"]
+        p2["bullish"] and p1["bearish"]
         and c1["open"] >= c2["close"]
         and c1["close"] <= c2["open"]
         and body1 >= body2 * 1.05
@@ -969,8 +931,7 @@ def detect_candlestick_patterns(candles):
         result["bearish"].append("Shooting Star")
 
     if (
-        p3["bullish"]
-        and p3["body_ratio"] > 0.5
+        p3["bullish"] and p3["body_ratio"] > 0.5
         and p2["body_ratio"] < 0.35
         and p1["bearish"]
         and c1["close"] < (c3["open"] + c3["close"]) / 2
@@ -979,15 +940,12 @@ def detect_candlestick_patterns(candles):
 
     if len(candles) >= 4:
         a, b, c, d = candles[-4:]
-
         pb = candle_parts(b)
         pc = candle_parts(c)
         pd = candle_parts(d)
 
         if (
-            pb["bearish"]
-            and pc["bearish"]
-            and pd["bearish"]
+            pb["bearish"] and pc["bearish"] and pd["bearish"]
             and c["close"] < b["close"]
             and d["close"] < c["close"]
             and pb["body_ratio"] > 0.45
@@ -1031,9 +989,7 @@ def detect_candlestick_patterns(candles):
     )
 
     result["display"] = (
-        " | ".join(all_patterns)
-        if all_patterns
-        else "No pattern"
+        " | ".join(all_patterns) if all_patterns else "No pattern"
     )
 
     return result
@@ -1057,7 +1013,6 @@ def analyze_candles(candles):
     upper, middle, lower = bollinger(closes)
 
     previous_volumes = volumes[-21:-1]
-
     average_volume = (
         sum(previous_volumes) / len(previous_volumes)
         if previous_volumes else 0
@@ -1073,7 +1028,7 @@ def analyze_candles(candles):
         "ema9": e9,
         "ema21": e21,
         "ema50": e50,
-        "rsi": rsi(closes),
+        "rsi": rsi(closes, 14),
         "macd": macd(closes),
         "bb_upper": upper,
         "bb_middle": middle,
@@ -1089,11 +1044,7 @@ def analyze_candles(candles):
 # ============================================================
 
 def calculate_signal(
-    five,
-    imbalance,
-    funding,
-    oi_change,
-    candle_patterns=None
+    five, imbalance, funding, oi_change, candle_patterns=None
 ):
     weights = get_learning_weights()
 
@@ -1108,15 +1059,11 @@ def calculate_signal(
 
     long_score = 0.0
     short_score = 0.0
-
-    features = {
-        name: 0.0 for name in LEARNING_FEATURES
-    }
+    features = {name: 0.0 for name in LEARNING_FEATURES}
 
     if five["ema9"] > five["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
-
     elif five["ema9"] < five["ema21"]:
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
@@ -1124,27 +1071,20 @@ def calculate_signal(
     if five["ema21"] > five["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
-
     elif five["ema21"] < five["ema50"]:
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
-    # UPDATED RSI SCORING:
-    # LONG: RSI 50-75
-    # SHORT: RSI 25-40
-
-    if 50 <= five["rsi"] <= 75:
+    if 48 <= five["rsi"] <= 70:
         features["rsi"] = 1
         long_score += 8 * weights["rsi"]
-
-    elif 25 <= five["rsi"] <= 40:
+    elif 30 <= five["rsi"] <= 52:
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
     if five["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
-
     elif five["macd"] < 0:
         features["macd"] = -1
         short_score += 8 * weights["macd"]
@@ -1153,7 +1093,6 @@ def calculate_signal(
         if five["ema9"] > five["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
-
         elif five["ema9"] < five["ema21"]:
             features["volume"] = -1
             short_score += 8 * weights["volume"]
@@ -1161,7 +1100,6 @@ def calculate_signal(
     if imbalance > 0.10:
         features["orderbook"] = 1
         long_score += 5 * weights["orderbook"]
-
     elif imbalance < -0.10:
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
@@ -1169,22 +1107,14 @@ def calculate_signal(
     if five["ema9"] > five["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
-
     elif five["ema9"] < five["ema21"]:
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
-    if (
-        five["ema9"] > five["ema21"]
-        and five["ema21"] > five["ema50"]
-    ):
+    if five["ema9"] > five["ema21"] > five["ema50"]:
         features["trend_alignment"] = 1
         long_score += 20 * weights["trend_alignment"]
-
-    elif (
-        five["ema9"] < five["ema21"]
-        and five["ema21"] < five["ema50"]
-    ):
+    elif five["ema9"] < five["ema21"] < five["ema50"]:
         features["trend_alignment"] = -1
         short_score += 20 * weights["trend_alignment"]
 
@@ -1192,7 +1122,6 @@ def calculate_signal(
         if five["ema9"] > five["ema21"]:
             features["adx"] = 1
             long_score += 6 * weights["adx"]
-
         elif five["ema9"] < five["ema21"]:
             features["adx"] = -1
             short_score += 6 * weights["adx"]
@@ -1200,7 +1129,6 @@ def calculate_signal(
     if funding > 0.0005:
         features["funding"] = -1
         short_score += 2 * weights["funding"]
-
     elif funding < -0.0005:
         features["funding"] = 1
         long_score += 2 * weights["funding"]
@@ -1209,7 +1137,6 @@ def calculate_signal(
         if five["ema9"] > five["ema21"]:
             features["open_interest"] = 1
             long_score += 2 * weights["open_interest"]
-
         elif five["ema9"] < five["ema21"]:
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
@@ -1218,7 +1145,6 @@ def calculate_signal(
 
     if candle_score > 0:
         long_score += candle_score
-
     elif candle_score < 0:
         short_score += abs(candle_score)
 
@@ -1227,18 +1153,16 @@ def calculate_signal(
 
     signal = "WAIT"
 
-    # UPDATED LONG CONFIRMATION RSI RANGE: 50-75
     long_confirmed = (
-        50 <= five["rsi"] <= 75
+        48 <= five["rsi"] <= 70
         and five["ema9"] > five["ema21"]
         and five["ema21"] > five["ema50"]
         and five["adx"] >= 16
         and five["volume_ratio"] >= 1.0
     )
 
-    # UPDATED SHORT CONFIRMATION RSI RANGE: 25-40
     short_confirmed = (
-        25 <= five["rsi"] <= 40
+        30 <= five["rsi"] <= 52
         and five["ema9"] < five["ema21"]
         and five["ema21"] < five["ema50"]
         and five["adx"] >= 16
@@ -1266,12 +1190,8 @@ def calculate_signal(
         "short_score": short_score,
         "signal": signal,
         "features": features,
-        "candle_pattern": candle_patterns.get(
-            "display", "No pattern"
-        ),
-        "candle_signal": candle_patterns.get(
-            "signal", "NEUTRAL"
-        ),
+        "candle_pattern": candle_patterns.get("display", "No pattern"),
+        "candle_signal": candle_patterns.get("signal", "NEUTRAL"),
         "candle_score": candle_score,
         "bullish_patterns": candle_patterns.get("bullish", []),
         "bearish_patterns": candle_patterns.get("bearish", []),
@@ -1287,14 +1207,12 @@ def position_gross_pnl(position, price):
     entry = number(position.get("entry"))
     quantity = number(position.get("quantity"))
     direction = 1 if position.get("side") == "LONG" else -1
-
     return (price - entry) * quantity * direction
 
 
 def position_fees(position, price):
     entry = number(position.get("entry"))
     quantity = number(position.get("quantity"))
-
     return (
         entry * quantity * FEE_RATE
         + price * quantity * FEE_RATE
@@ -1302,9 +1220,8 @@ def position_fees(position, price):
 
 
 def position_net_pnl(position, price):
-    return (
-        position_gross_pnl(position, price)
-        - position_fees(position, price)
+    return position_gross_pnl(position, price) - position_fees(
+        position, price
     )
 
 
@@ -1314,13 +1231,10 @@ def account_totals():
         positions = [dict(p) for p in state["positions"]]
 
     unrealized = sum(
-        number(p.get("unrealized_pnl"))
-        for p in positions
+        number(p.get("unrealized_pnl")) for p in positions
     )
-
     used_margin = sum(
-        number(p.get("margin"))
-        for p in positions
+        number(p.get("margin")) for p in positions
     )
 
     return {
@@ -1353,11 +1267,7 @@ def symbol_in_cooldown(symbol):
 # ============================================================
 
 def open_paper_position(
-    symbol,
-    side,
-    price,
-    features=None,
-    atr_value=0.0
+    symbol, side, price, features=None, atr_value=0.0
 ):
     if (
         not PAPER_TRADING
@@ -1379,8 +1289,7 @@ def open_paper_position(
             return False
 
         if any(
-            p.get("symbol") == symbol
-            for p in state["positions"]
+            p.get("symbol") == symbol for p in state["positions"]
         ):
             return False
 
@@ -1389,30 +1298,19 @@ def open_paper_position(
             return False
 
         balance = number(state["balance"])
-
         if balance <= 0:
             return False
 
         used_margin = sum(
-            number(p.get("margin"))
-            for p in state["positions"]
+            number(p.get("margin")) for p in state["positions"]
         )
-
-        available_balance = max(
-            0.0,
-            balance - used_margin
-        )
+        available_balance = max(0.0, balance - used_margin)
 
         if available_balance <= 0:
             return False
 
         stop_distance = price * STOP_LOSS_PERCENT
-
-        risk_amount = min(
-            RISK_PER_TRADE,
-            balance * 0.005
-        )
-
+        risk_amount = min(RISK_PER_TRADE, balance * 0.005)
         quantity = risk_amount / stop_distance
 
         minimum_quantity = MIN_TRADE_NOTIONAL / price
@@ -1420,37 +1318,27 @@ def open_paper_position(
 
         max_notional = balance * MAX_EQUITY_EXPOSURE
         affordable_notional = available_balance * LEVERAGE
-
-        max_notional = min(
-            max_notional,
-            affordable_notional
-        )
+        max_notional = min(max_notional, affordable_notional)
 
         if max_notional < MIN_TRADE_NOTIONAL:
             return False
 
-        quantity = min(
-            quantity,
-            max_notional / price
-        )
+        quantity = min(quantity, max_notional / price)
 
         if quantity <= 0:
             return False
 
         notional = quantity * price
-
         if notional < MIN_TRADE_NOTIONAL:
             return False
 
         margin = notional / LEVERAGE
-
         if margin > available_balance:
             return False
 
         if side == "LONG":
             stop_price = price * (1 - STOP_LOSS_PERCENT)
             target_price = price * (1 + TAKE_PROFIT_PERCENT)
-
         else:
             stop_price = price * (1 + STOP_LOSS_PERCENT)
             target_price = price * (1 - TAKE_PROFIT_PERCENT)
@@ -1469,17 +1357,14 @@ def open_paper_position(
             "stop_loss": stop_price,
             "stop_distance": stop_distance,
             "risk_amount": quantity * stop_distance,
-            "reward_risk": (
-                TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT
-            ),
+            "reward_risk": TAKE_PROFIT_PERCENT / STOP_LOSS_PERCENT,
             "opened": now_text(),
             "unrealized_pnl": 0.0,
             "gross_unrealized_pnl": 0.0,
             "entry_fee": notional * FEE_RATE,
             "fee_rate": FEE_RATE,
             "feature_snapshot": learning_snapshot_for_side(
-                features or {},
-                side
+                features or {}, side
             )
         }
 
@@ -1491,21 +1376,14 @@ def open_paper_position(
                 p for p in state["positions"]
                 if p.get("trade_id") != position["trade_id"]
             ]
-
         log.error("POSITION ROLLED BACK - JSON SAVE FAILED")
         return False
 
     log.info(
         "PAPER OPEN | %s | %s | Entry %.8f | SL %.8f | TP %.8f | Notional %.2f | Margin %.2f",
-        side,
-        symbol,
-        price,
-        stop_price,
-        target_price,
-        notional,
-        margin
+        side, symbol, price, stop_price, target_price,
+        notional, margin
     )
-
     return True
 
 
@@ -1518,7 +1396,6 @@ def close_paper_position(position, price, reason):
         return False
 
     trade_id = position.get("trade_id")
-
     if not trade_id or price <= 0:
         return False
 
@@ -1566,13 +1443,9 @@ def close_paper_position(position, price, reason):
             "exit": price,
             "quantity": quantity,
             "notional": number(
-                live.get("notional"),
-                entry * quantity
+                live.get("notional"), entry * quantity
             ),
-            "leverage": number(
-                live.get("leverage"),
-                LEVERAGE
-            ),
+            "leverage": number(live.get("leverage"), LEVERAGE),
             "margin": number(live.get("margin")),
             "gross_pnl": round(gross, 6),
             "fees": round(fees, 6),
@@ -1599,14 +1472,9 @@ def close_paper_position(position, price, reason):
 
         state["history"].insert(0, trade)
         state["history"] = state["history"][:MAX_HISTORY]
-
         state["balance"] += net
         state["daily_pnl"] += net
-
-        state["last_closed_by_symbol"][
-            live.get("symbol")
-        ] = time.time()
-
+        state["last_closed_by_symbol"][live.get("symbol")] = time.time()
         state["positions"].remove(live)
 
         if state["daily_pnl"] <= -DAILY_LOSS_LIMIT:
@@ -1633,12 +1501,8 @@ def close_paper_position(position, price, reason):
 
     log.info(
         "PAPER CLOSED | %s | %s | Net PNL %.4f | %s",
-        trade["side"],
-        trade["symbol"],
-        net,
-        reason
+        trade["side"], trade["symbol"], net, reason
     )
-
     return True
 
 
@@ -1648,9 +1512,7 @@ def close_paper_position(position, price, reason):
 
 def monitor_positions():
     with lock:
-        positions = [
-            dict(p) for p in state["positions"]
-        ]
+        positions = [dict(p) for p in state["positions"]]
 
     changed = False
 
@@ -1661,8 +1523,7 @@ def monitor_positions():
             side = position.get("side")
 
             if (
-                entry <= 0
-                or quantity <= 0
+                entry <= 0 or quantity <= 0
                 or side not in ("LONG", "SHORT")
             ):
                 continue
@@ -1674,7 +1535,6 @@ def monitor_positions():
                 continue
 
             price = get_price(position["symbol"])
-
             net = position_net_pnl(position, price)
             gross = position_gross_pnl(position, price)
 
@@ -1690,33 +1550,14 @@ def monitor_positions():
 
             if side == "LONG":
                 if price <= stop_price:
-                    close_paper_position(
-                        position,
-                        price,
-                        "STOP LOSS"
-                    )
-
+                    close_paper_position(position, price, "STOP LOSS")
                 elif price >= target_price:
-                    close_paper_position(
-                        position,
-                        price,
-                        "TAKE PROFIT"
-                    )
-
+                    close_paper_position(position, price, "TAKE PROFIT")
             else:
                 if price >= stop_price:
-                    close_paper_position(
-                        position,
-                        price,
-                        "STOP LOSS"
-                    )
-
+                    close_paper_position(position, price, "STOP LOSS")
                 elif price <= target_price:
-                    close_paper_position(
-                        position,
-                        price,
-                        "TAKE PROFIT"
-                    )
+                    close_paper_position(position, price, "TAKE PROFIT")
 
         except Exception:
             log.exception(
@@ -1735,20 +1576,15 @@ def monitor_positions():
 def risk_check():
     with lock:
         realized = number(state["daily_pnl"])
-
         unrealized = sum(
             number(p.get("unrealized_pnl"))
             for p in state["positions"]
         )
-
         total = realized + unrealized
 
         if total <= -DAILY_LOSS_LIMIT:
             state["running"] = False
-            log.warning(
-                "DAILY LOSS LIMIT REACHED | %.4f",
-                total
-            )
+            log.warning("DAILY LOSS LIMIT REACHED | %.4f", total)
             return False
 
     return True
@@ -1789,13 +1625,11 @@ def check_private_account():
                 number(wallet.get("walletBalance"))
                 if wallet else 0.0
             )
-
             state["private_status"] = "CONNECTED - READ ONLY"
 
     except Exception:
         with lock:
             state["private_status"] = "CONNECTION FAILED"
-
         log.exception("Private account check failed")
 
     save_state()
@@ -1806,42 +1640,26 @@ def check_private_account():
 # ============================================================
 
 def scan_symbol(symbol):
-    candles = get_candles(
-        symbol,
-        CANDLE_INTERVAL,
-        200
-    )
-
+    candles = get_candles(symbol, CANDLE_INTERVAL, 200)
     five = analyze_candles(candles)
-    current_price = get_price(symbol)
 
+    current_price = get_price(symbol)
     five["price"] = current_price
 
     candle_patterns = detect_candlestick_patterns(candles)
-
     imbalance = get_orderbook(symbol)
     funding = get_funding(symbol)
     oi_change = get_open_interest(symbol)
 
     signal = calculate_signal(
-        five,
-        imbalance,
-        funding,
-        oi_change,
-        candle_patterns
+        five, imbalance, funding, oi_change, candle_patterns
     )
 
     trend = (
         "BULLISH"
-        if (
-            five["ema9"] > five["ema21"]
-            and five["ema21"] > five["ema50"]
-        )
+        if five["ema9"] > five["ema21"] > five["ema50"]
         else "BEARISH"
-        if (
-            five["ema9"] < five["ema21"]
-            and five["ema21"] < five["ema50"]
-        )
+        if five["ema9"] < five["ema21"] < five["ema50"]
         else "MIXED"
     )
 
@@ -1890,8 +1708,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.7 JSON worker started - 5M ONLY")
-
+    log.info("CoinSentra V16.8 worker started - 5M ONLY")
     last_private_check = 0.0
 
     while True:
@@ -1904,21 +1721,15 @@ def background_worker():
             for symbol in SYMBOLS:
                 try:
                     scan_symbol(symbol)
-
                 except Exception as error:
-                    log.exception(
-                        "Scan failed for %s",
-                        symbol
-                    )
+                    log.exception("Scan failed for %s", symbol)
 
                     with lock:
                         existing = dict(
                             state["symbols"].get(symbol, {})
                         )
-
                         existing["symbol"] = symbol
                         existing["data_error"] = str(error)[:180]
-
                         state["symbols"][symbol] = existing
 
             risk_check()
@@ -1932,10 +1743,8 @@ def background_worker():
 
         except Exception:
             log.exception("Worker cycle failed")
-
             with lock:
                 state["last_error"] = "Worker cycle failed"
-
             save_state()
 
         if time.time() - last_private_check >= 300:
@@ -1943,10 +1752,7 @@ def background_worker():
             last_private_check = time.time()
 
         elapsed = time.time() - cycle_start
-
-        time.sleep(
-            max(1, SCAN_SECONDS - elapsed)
-        )
+        time.sleep(max(1, SCAN_SECONDS - elapsed))
 
 
 def start_worker_once():
@@ -1961,7 +1767,6 @@ def start_worker_once():
             name="CoinSentraV16Worker",
             daemon=True
         )
-
         thread.start()
         worker_started = True
 
@@ -1973,16 +1778,10 @@ def start_worker_once():
 def trade_statistics():
     with lock:
         trades = [
-            dict(t)
-            for t in state["history"]
-            if clean_trade(t)
+            dict(t) for t in state["history"] if clean_trade(t)
         ]
 
-    pnls = [
-        number(t.get("pnl"))
-        for t in trades
-    ]
-
+    pnls = [number(t.get("pnl")) for t in trades]
     wins_list = [p for p in pnls if p > 0]
     losses_list = [p for p in pnls if p < 0]
 
@@ -1991,11 +1790,7 @@ def trade_statistics():
     count = len(pnls)
 
     realized = sum(pnls)
-    fees = sum(
-        number(t.get("fees"))
-        for t in trades
-    )
-
+    fees = sum(number(t.get("fees")) for t in trades)
     gross_wins = sum(wins_list)
     gross_losses = abs(sum(losses_list))
 
@@ -2005,49 +1800,31 @@ def trade_statistics():
         else (gross_wins if gross_wins else 0)
     )
 
-    average_win = (
-        gross_wins / wins
-        if wins else 0
-    )
-
-    average_loss = (
-        gross_losses / losses
-        if losses else 0
-    )
+    average_win = gross_wins / wins if wins else 0
+    average_loss = gross_losses / losses if losses else 0
 
     chronological = list(reversed(pnls))
-
     running_equity = START_BALANCE
     peak_equity = START_BALANCE
     max_drawdown = 0.0
 
     for pnl in chronological:
         running_equity += pnl
-        peak_equity = max(
-            peak_equity,
-            running_equity
-        )
+        peak_equity = max(peak_equity, running_equity)
 
         if peak_equity > 0:
             drawdown = (
                 (peak_equity - running_equity)
                 / peak_equity * 100
             )
-
-            max_drawdown = max(
-                max_drawdown,
-                drawdown
-            )
+            max_drawdown = max(max_drawdown, drawdown)
 
     return {
         "completed_count": count,
         "wins": wins,
         "losses": losses,
         "breakeven": count - wins - losses,
-        "win_rate": round(
-            wins / count * 100,
-            2
-        ) if count else 0,
+        "win_rate": round(wins / count * 100, 2) if count else 0,
         "history_realized_pnl": round(realized, 4),
         "total_fees": round(fees, 4),
         "profit_factor": round(profit_factor, 3),
@@ -2083,7 +1860,7 @@ HTML = """
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta charset="UTF-8">
-<title>CoinSentra Trading Brain V16.7</title>
+<title>CoinSentra Trading Brain V16.8</title>
 <style>
 *{box-sizing:border-box}
 body{background:#080d18;color:#e9efff;font-family:Arial;margin:0;padding:15px}
@@ -2113,7 +1890,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.7 | BYBIT | PAPER MODE ONLY | 5M ANALYSIS + CANDLE PATTERNS | MAX 3 POSITIONS</div>
+<div class="small">TRADING BRAIN V16.8 | BYBIT | PAPER MODE ONLY | 5M ANALYSIS + CANDLE PATTERNS | MAX 3 POSITIONS</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2205,7 +1982,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.7 | 5-minute-only analysis + candlestick recognition<br>
+Version 16.8 | Wilder RSI (14) | Closed 5-minute candles<br>
 Patterns: Engulfing, Hammer, Shooting Star, Morning/Evening Star, Three Soldiers/Crows, Doji, Wicks<br>
 Maximum 3 positions | Minimum $60 notional<br>
 Stop loss 1.4% | Take profit 1.7%<br>
@@ -2218,13 +1995,10 @@ Last error: <span id="error">None</span>
 <script>
 async function control(action){
  const message=document.getElementById('control');
-
  if(action==='stop'){
   if(!confirm('End trading? Existing positions remain monitored.'))return;
  }
-
  message.textContent='Sending command...';
-
  try{
   const response=await fetch('/control/'+action,{method:'POST'});
   const data=await response.json();
@@ -2286,7 +2060,6 @@ async function update(){
   document.getElementById('drawdown').textContent=s.max_drawdown+'%';
 
   let learning=d.learning;
-
   document.getElementById('learnsamples').textContent=learning.samples+'/'+learning.minimum_samples+' minimum';
   document.getElementById('learnupdates').textContent=learning.updates;
   document.getElementById('learnresult').textContent=learning.last_result||'Waiting';
@@ -2386,13 +2159,13 @@ def home():
 @app.route("/health")
 def health():
     start_worker_once()
-
     return jsonify({
         "status": "ok",
         "version": VERSION,
         "paper_trading": True,
         "storage": "LOCAL JSON",
-        "analysis_interval": "5 minutes"
+        "analysis_interval": "5 minutes",
+        "rsi_method": "Wilder 14"
     })
 
 
@@ -2421,10 +2194,7 @@ def api_data():
     start_worker_once()
 
     with lock:
-        positions = [
-            dict(p) for p in state["positions"]
-        ]
-
+        positions = [dict(p) for p in state["positions"]]
         history = []
 
         for item in state["history"]:
@@ -2442,23 +2212,17 @@ def api_data():
         last_error = state["last_error"]
 
     unrealized = sum(
-        number(p.get("unrealized_pnl"))
-        for p in positions
+        number(p.get("unrealized_pnl")) for p in positions
     )
-
     used_margin = sum(
-        number(p.get("margin"))
-        for p in positions
+        number(p.get("margin")) for p in positions
     )
 
     totals = {
         "balance": round(balance, 4),
         "unrealized": round(unrealized, 4),
         "equity": round(balance + unrealized, 4),
-        "available_balance": round(
-            balance - used_margin,
-            4
-        ),
+        "available_balance": round(balance - used_margin, 4),
         "used_margin": round(used_margin, 4)
     }
 
@@ -2505,9 +2269,7 @@ def stop():
     return jsonify({
         "status": "stopped",
         "saved": saved,
-        "message": (
-            "Trading stopped. Existing positions remain monitored."
-        )
+        "message": "Trading stopped. Existing positions remain monitored."
     })
 
 
