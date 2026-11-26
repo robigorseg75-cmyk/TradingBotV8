@@ -14,7 +14,7 @@ from pybit.unified_trading import HTTP
 
 # ============================================================
 # COINSENTRA TRADING BRAIN V16.7
-# BYBIT | RENDER | LOCAL JSON | PAPER TRADING
+# BYBIT | RENDER | LOCAL JSON | PAPER TRADING | 5M ONLY
 # ============================================================
 
 VERSION = "16.7"
@@ -39,8 +39,7 @@ MAX_EQUITY_EXPOSURE = 0.10
 
 SCAN_SECONDS = 30
 ENTRY_SCORE = 55
-RSI_INTERVAL = "5"
-TREND_INTERVAL = "15"
+CANDLE_INTERVAL = "5"
 
 STOP_LOSS_PERCENT = 0.014
 TAKE_PROFIT_PERCENT = 0.017
@@ -57,7 +56,7 @@ LEARNING_FEATURES = [
     "volume",
     "orderbook",
     "confirmation",
-    "higher_timeframe",
+    "trend_alignment",
     "adx",
     "funding",
     "open_interest"
@@ -226,7 +225,6 @@ def state_snapshot():
             "learning": state["learning"]
         }
 
-        # Make a detached JSON-compatible copy while locked.
         return json.loads(json.dumps(snapshot, allow_nan=False))
 
 
@@ -239,7 +237,6 @@ def save_state():
         snapshot = state_snapshot()
 
         os.makedirs(DATA_DIR, exist_ok=True)
-
         temporary = STATE_FILE + ".tmp"
 
         with open(temporary, "w", encoding="utf-8") as file:
@@ -253,7 +250,6 @@ def save_state():
             os.fsync(file.fileno())
 
         os.replace(temporary, STATE_FILE)
-
         return True
 
     except Exception:
@@ -351,8 +347,20 @@ def load_state():
         merged["weights"] = default_weights()
 
         for key in LEARNING_FEATURES:
+            old_key = (
+                "higher_timeframe"
+                if key == "trend_alignment"
+                else key
+            )
+
             merged["weights"][key] = clamp(
-                number(old_weights.get(key), 1.0),
+                number(
+                    old_weights.get(
+                        key,
+                        old_weights.get(old_key, 1.0)
+                    ),
+                    1.0
+                ),
                 LEARNING_MIN_WEIGHT,
                 LEARNING_MAX_WEIGHT
             )
@@ -369,7 +377,6 @@ def load_state():
 
         state["learning"] = merged
 
-        # Normalize restored open positions.
         valid_positions = []
 
         for position in state["positions"]:
@@ -587,7 +594,7 @@ def get_price(symbol):
     return price_value
 
 
-def get_candles(symbol, interval, limit=200):
+def get_candles(symbol, interval=CANDLE_INTERVAL, limit=200):
     result = check_bybit_result(
         public_api.get_kline(
             category=CATEGORY,
@@ -622,7 +629,6 @@ def get_candles(symbol, interval, limit=200):
     if len(candles) < 61:
         raise RuntimeError("Insufficient completed candles")
 
-    # Exclude the currently forming candle.
     completed = candles[:-1]
 
     if len(completed) < 60:
@@ -900,7 +906,6 @@ def detect_candlestick_patterns(candles):
     body1 = p1["body"]
     body2 = p2["body"]
 
-    # Bullish engulfing
     if (
         p2["bearish"]
         and p1["bullish"]
@@ -910,7 +915,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bullish"].append("Bullish Engulfing")
 
-    # Hammer
     if (
         p1["lower"] >= body1 * 2
         and p1["upper"] <= body1 * 0.6
@@ -919,7 +923,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bullish"].append("Hammer")
 
-    # Morning star
     if (
         p3["bearish"]
         and p3["body_ratio"] > 0.5
@@ -929,7 +932,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bullish"].append("Morning Star")
 
-    # Three white soldiers
     if len(candles) >= 4:
         a, b, c, d = candles[-4:]
 
@@ -950,7 +952,6 @@ def detect_candlestick_patterns(candles):
         ):
             result["bullish"].append("Three White Soldiers")
 
-    # Bearish engulfing
     if (
         p2["bullish"]
         and p1["bearish"]
@@ -960,7 +961,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bearish"].append("Bearish Engulfing")
 
-    # Shooting star
     if (
         p1["upper"] >= body1 * 2
         and p1["lower"] <= body1 * 0.6
@@ -969,7 +969,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bearish"].append("Shooting Star")
 
-    # Evening star
     if (
         p3["bullish"]
         and p3["body_ratio"] > 0.5
@@ -979,7 +978,6 @@ def detect_candlestick_patterns(candles):
     ):
         result["bearish"].append("Evening Star")
 
-    # Three black crows
     if len(candles) >= 4:
         a, b, c, d = candles[-4:]
 
@@ -999,7 +997,6 @@ def detect_candlestick_patterns(candles):
         ):
             result["bearish"].append("Three Black Crows")
 
-    # Neutral patterns
     if p1["body_ratio"] <= 0.10:
         result["neutral"].append("Doji")
 
@@ -1044,7 +1041,7 @@ def detect_candlestick_patterns(candles):
 
 
 # ============================================================
-# CANDLE ANALYSIS
+# CANDLE ANALYSIS - 5 MINUTES ONLY
 # ============================================================
 
 def analyze_candles(candles):
@@ -1089,13 +1086,11 @@ def analyze_candles(candles):
 
 
 # ============================================================
-# SIGNAL ENGINE
+# SIGNAL ENGINE - 5 MINUTES ONLY
 # ============================================================
 
 def calculate_signal(
     five,
-    fifteen,
-    hourly,
     imbalance,
     funding,
     oi_change,
@@ -1119,19 +1114,19 @@ def calculate_signal(
         name: 0.0 for name in LEARNING_FEATURES
     }
 
-    if fifteen["ema9"] > fifteen["ema21"]:
+    if five["ema9"] > five["ema21"]:
         features["trend_fast"] = 1
         long_score += 14 * weights["trend_fast"]
 
-    elif fifteen["ema9"] < fifteen["ema21"]:
+    elif five["ema9"] < five["ema21"]:
         features["trend_fast"] = -1
         short_score += 14 * weights["trend_fast"]
 
-    if fifteen["ema21"] > fifteen["ema50"]:
+    if five["ema21"] > five["ema50"]:
         features["trend_slow"] = 1
         long_score += 12 * weights["trend_slow"]
 
-    elif fifteen["ema21"] < fifteen["ema50"]:
+    elif five["ema21"] < five["ema50"]:
         features["trend_slow"] = -1
         short_score += 12 * weights["trend_slow"]
 
@@ -1143,20 +1138,20 @@ def calculate_signal(
         features["rsi"] = -1
         short_score += 8 * weights["rsi"]
 
-    if fifteen["macd"] > 0:
+    if five["macd"] > 0:
         features["macd"] = 1
         long_score += 8 * weights["macd"]
 
-    elif fifteen["macd"] < 0:
+    elif five["macd"] < 0:
         features["macd"] = -1
         short_score += 8 * weights["macd"]
 
-    if fifteen["volume_ratio"] >= 1.0:
-        if fifteen["ema9"] > fifteen["ema21"]:
+    if five["volume_ratio"] >= 1.0:
+        if five["ema9"] > five["ema21"]:
             features["volume"] = 1
             long_score += 8 * weights["volume"]
 
-        elif fifteen["ema9"] < fifteen["ema21"]:
+        elif five["ema9"] < five["ema21"]:
             features["volume"] = -1
             short_score += 8 * weights["volume"]
 
@@ -1168,34 +1163,34 @@ def calculate_signal(
         features["orderbook"] = -1
         short_score += 5 * weights["orderbook"]
 
-    if fifteen["ema9"] > fifteen["ema21"]:
+    if five["ema9"] > five["ema21"]:
         features["confirmation"] = 1
         long_score += 15 * weights["confirmation"]
 
-    elif fifteen["ema9"] < fifteen["ema21"]:
+    elif five["ema9"] < five["ema21"]:
         features["confirmation"] = -1
         short_score += 15 * weights["confirmation"]
 
     if (
-        fifteen["ema9"] > fifteen["ema21"]
-        and fifteen["ema21"] > fifteen["ema50"]
+        five["ema9"] > five["ema21"]
+        and five["ema21"] > five["ema50"]
     ):
-        features["higher_timeframe"] = 1
-        long_score += 20 * weights["higher_timeframe"]
+        features["trend_alignment"] = 1
+        long_score += 20 * weights["trend_alignment"]
 
     elif (
-        fifteen["ema9"] < fifteen["ema21"]
-        and fifteen["ema21"] < fifteen["ema50"]
+        five["ema9"] < five["ema21"]
+        and five["ema21"] < five["ema50"]
     ):
-        features["higher_timeframe"] = -1
-        short_score += 20 * weights["higher_timeframe"]
+        features["trend_alignment"] = -1
+        short_score += 20 * weights["trend_alignment"]
 
-    if fifteen["adx"] >= 16:
-        if fifteen["ema9"] > fifteen["ema21"]:
+    if five["adx"] >= 16:
+        if five["ema9"] > five["ema21"]:
             features["adx"] = 1
             long_score += 6 * weights["adx"]
 
-        elif fifteen["ema9"] < fifteen["ema21"]:
+        elif five["ema9"] < five["ema21"]:
             features["adx"] = -1
             short_score += 6 * weights["adx"]
 
@@ -1208,11 +1203,11 @@ def calculate_signal(
         long_score += 2 * weights["funding"]
 
     if oi_change > 0.2:
-        if fifteen["ema9"] > fifteen["ema21"]:
+        if five["ema9"] > five["ema21"]:
             features["open_interest"] = 1
             long_score += 2 * weights["open_interest"]
 
-        elif fifteen["ema9"] < fifteen["ema21"]:
+        elif five["ema9"] < five["ema21"]:
             features["open_interest"] = -1
             short_score += 2 * weights["open_interest"]
 
@@ -1231,25 +1226,25 @@ def calculate_signal(
 
     long_confirmed = (
         48 <= five["rsi"] <= 70
-        and fifteen["ema9"] > fifteen["ema21"]
-        and fifteen["ema21"] > fifteen["ema50"]
-        and fifteen["adx"] >= 16
-        and fifteen["volume_ratio"] >= 1.0
+        and five["ema9"] > five["ema21"]
+        and five["ema21"] > five["ema50"]
+        and five["adx"] >= 16
+        and five["volume_ratio"] >= 1.0
     )
 
     short_confirmed = (
         30 <= five["rsi"] <= 52
-        and fifteen["ema9"] < fifteen["ema21"]
-        and fifteen["ema21"] < fifteen["ema50"]
-        and fifteen["adx"] >= 16
-        and fifteen["volume_ratio"] >= 1.0
+        and five["ema9"] < five["ema21"]
+        and five["ema21"] < five["ema50"]
+        and five["adx"] >= 16
+        and five["volume_ratio"] >= 1.0
     )
 
     if (
         long_score >= ENTRY_SCORE
         and long_score - short_score >= 12
         and long_confirmed
-        and fifteen["price"] > fifteen["ema21"]
+        and five["price"] > five["ema21"]
     ):
         signal = "LONG"
 
@@ -1257,7 +1252,7 @@ def calculate_signal(
         short_score >= ENTRY_SCORE
         and short_score - long_score >= 12
         and short_confirmed
-        and fifteen["price"] < fifteen["ema21"]
+        and five["price"] < five["ema21"]
     ):
         signal = "SHORT"
 
@@ -1802,31 +1797,22 @@ def check_private_account():
 
 
 # ============================================================
-# SCANNER
+# SCANNER - 5 MINUTES ONLY
 # ============================================================
 
 def scan_symbol(symbol):
-    five_candles = get_candles(
+    candles = get_candles(
         symbol,
-        RSI_INTERVAL,
+        CANDLE_INTERVAL,
         200
     )
 
-    five = analyze_candles(five_candles)
+    five = analyze_candles(candles)
+    current_price = get_price(symbol)
 
-    fifteen_candles = get_candles(
-        symbol,
-        TREND_INTERVAL,
-        200
-    )
+    five["price"] = current_price
 
-    fifteen = analyze_candles(fifteen_candles)
-
-    fifteen["price"] = get_price(symbol)
-
-    candle_patterns = detect_candlestick_patterns(
-        five_candles
-    )
+    candle_patterns = detect_candlestick_patterns(candles)
 
     imbalance = get_orderbook(symbol)
     funding = get_funding(symbol)
@@ -1834,8 +1820,6 @@ def scan_symbol(symbol):
 
     signal = calculate_signal(
         five,
-        fifteen,
-        fifteen,
         imbalance,
         funding,
         oi_change,
@@ -1845,34 +1829,33 @@ def scan_symbol(symbol):
     trend = (
         "BULLISH"
         if (
-            fifteen["ema9"] > fifteen["ema21"]
-            and fifteen["ema21"] > fifteen["ema50"]
+            five["ema9"] > five["ema21"]
+            and five["ema21"] > five["ema50"]
         )
         else "BEARISH"
         if (
-            fifteen["ema9"] < fifteen["ema21"]
-            and fifteen["ema21"] < fifteen["ema50"]
+            five["ema9"] < five["ema21"]
+            and five["ema21"] < five["ema50"]
         )
         else "MIXED"
     )
 
     data = {
         "symbol": symbol,
-        "price": fifteen["price"],
+        "price": current_price,
         "rsi": round(five["rsi"], 2),
         "rsi_5m": round(five["rsi"], 2),
-        "rsi_15m": round(fifteen["rsi"], 2),
-        "macd": round(fifteen["macd"], 8),
-        "adx": round(fifteen["adx"], 2),
-        "atr": round(fifteen["atr"], 8),
-        "ema9": round(fifteen["ema9"], 8),
-        "ema21": round(fifteen["ema21"], 8),
-        "ema50": round(fifteen["ema50"], 8),
-        "volume_ratio": round(fifteen["volume_ratio"], 2),
+        "macd": round(five["macd"], 8),
+        "adx": round(five["adx"], 2),
+        "atr": round(five["atr"], 8),
+        "ema9": round(five["ema9"], 8),
+        "ema21": round(five["ema21"], 8),
+        "ema50": round(five["ema50"], 8),
+        "volume_ratio": round(five["volume_ratio"], 2),
         "orderbook_imbalance": round(imbalance, 3),
         "funding": funding,
         "oi_change": round(oi_change, 3),
-        "hourly_trend": trend,
+        "trend": trend,
         **signal,
         "updated": now_text(),
         "data_error": None
@@ -1889,9 +1872,9 @@ def scan_symbol(symbol):
         open_paper_position(
             symbol,
             signal["signal"],
-            fifteen["price"],
+            current_price,
             signal["features"],
-            fifteen["atr"]
+            five["atr"]
         )
 
     return data
@@ -1902,7 +1885,7 @@ def scan_symbol(symbol):
 # ============================================================
 
 def background_worker():
-    log.info("CoinSentra V16.7 JSON worker started")
+    log.info("CoinSentra V16.7 JSON worker started - 5M ONLY")
 
     last_private_check = 0.0
 
@@ -1931,7 +1914,6 @@ def background_worker():
                         existing["symbol"] = symbol
                         existing["data_error"] = str(error)[:180]
 
-                        # Preserve the last valid market data.
                         state["symbols"][symbol] = existing
 
             risk_check()
@@ -2126,7 +2108,7 @@ th{color:#9bb0ce}
 <body>
 
 <h1>COINSENTRA AI</h1>
-<div class="small">TRADING BRAIN V16.7 | BYBIT | PAPER MODE ONLY | 5M RSI + 15M TREND + CANDLE PATTERNS | MAX 3 POSITIONS</div>
+<div class="small">TRADING BRAIN V16.7 | BYBIT | PAPER MODE ONLY | 5M ANALYSIS + CANDLE PATTERNS | MAX 3 POSITIONS</div>
 
 <div class="grid">
 <div class="card">Realized Balance<div class="big" id="balance">$10,000</div></div>
@@ -2185,14 +2167,14 @@ th{color:#9bb0ce}
 <div id="scanner" class="small">WAITING FOR MARKET DATA</div>
 <div class="scroll">
 <table>
-<thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>15M TREND</th></tr></thead>
+<thead><tr><th>COIN</th><th>PRICE</th><th>LONG</th><th>SHORT</th><th>SIGNAL</th><th>5M TREND</th></tr></thead>
 <tbody id="markets"></tbody>
 </table>
 </div>
 </div>
 
 <div class="card">
-<h2>INDICATORS (5M RSI / 15M TREND / CANDLE PATTERNS)</h2>
+<h2>INDICATORS (5M ANALYSIS)</h2>
 <div id="indicators" class="small">Waiting for market data...</div>
 </div>
 
@@ -2218,7 +2200,7 @@ th{color:#9bb0ce}
 </div>
 
 <div class="card small">
-Version 16.7 | Easier entry scoring + candlestick recognition<br>
+Version 16.7 | 5-minute-only analysis + candlestick recognition<br>
 Patterns: Engulfing, Hammer, Shooting Star, Morning/Evening Star, Three Soldiers/Crows, Doji, Wicks<br>
 Maximum 3 positions | Minimum $60 notional<br>
 Stop loss 1.4% | Take profit 1.7%<br>
@@ -2327,13 +2309,17 @@ async function update(){
    <td class="green">${s.long_score??0}</td>
    <td class="red">${s.short_score??0}</td>
    <td class="${color(s.signal)}">${safe(s.signal||'WAIT')}</td>
-   <td>${safe(s.hourly_trend||'-')}</td></tr>`;
+   <td>${safe(s.trend||'-')}</td></tr>`;
 
    details+=`<p><b>${safe(s.symbol)}</b> |
-   5M RSI ${s.rsi_5m??'-'} | 15M RSI ${s.rsi_15m??'-'} |
-   15M ADX ${s.adx??'-'} |
+   5M RSI ${s.rsi_5m??'-'} |
+   5M ADX ${s.adx??'-'} |
+   5M EMA9 ${price(s.ema9)} |
+   5M EMA21 ${price(s.ema21)} |
+   5M EMA50 ${price(s.ema50)} |
+   5M MACD ${s.macd??'-'} |
+   5M Volume ${s.volume_ratio??'-'}x |
    ATR ${price(s.atr)} |
-   15M Volume ${s.volume_ratio??'-'}x |
    Orderbook ${s.orderbook_imbalance??'-'} |
    Funding ${s.funding??'-'} |
    OI ${s.oi_change??'-'}% |
@@ -2400,7 +2386,8 @@ def health():
         "status": "ok",
         "version": VERSION,
         "paper_trading": True,
-        "storage": "LOCAL JSON"
+        "storage": "LOCAL JSON",
+        "analysis_interval": "5 minutes"
     })
 
 
